@@ -59,6 +59,9 @@ Upcoming changes</a>
     Output correct version from java -jar jenkins.war --version (broken since 1.410)
   <li class=bug>
     Correct usage text from java -jar jenkins.war --help
+  <li class=bug>
+    Incremental maven jobs: if POM parsing failed, do a full build next time.
+    (<a href="http://issues.jenkins-ci.org/browse/JENKINS-9848">issue 9848</a>)
   <li class=rfe>
     CLI command page now lists all the available commands
     (<a href="http://issues.jenkins-ci.org/browse/JENKINS-9789">issue 9789</a>)
@@ -71,6 +74,12 @@ Upcoming changes</a>
   <li class=rfe>
     Run maven jobs as headless process. on OSX this avoid jumping Dock icon to take focus.
     (<a href="http://issues.jenkins-ci.org/browse/JENKINS-9785">issue 9785</a>)
+  <li class=rfe>
+    Reduce memory consumption of dependency calculation in maven jobs.
+    (<a href="http://issues.jenkins-ci.org/browse/JENKINS-9845">issue 9845</a>)
+  <li class=rfe>
+    Strongly encrypt proxy credentials
+    (<a href="http://issues.jenkins-ci.org/browse/JENKINS-4002">issue 4002</a>)
 </ul>
 </div><!--=TRUNK-END=-->
 
