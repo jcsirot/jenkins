@@ -26,6 +26,8 @@ package hudson.model;
 import com.thoughtworks.xstream.converters.UnmarshallingContext;
 import hudson.diagnosis.OldDataMonitor;
 import hudson.util.XStream2;
+import jenkins.model.Jenkins;
+import jenkins.util.NonLocalizable;
 import org.jvnet.localizer.Localizable;
 import org.kohsuke.stapler.export.Exported;
 import org.kohsuke.stapler.export.ExportedBean;
@@ -204,12 +206,12 @@ public class HealthReport implements Serializable, Comparable<HealthReport> {
      */
     public String getIconUrl(String size) {
         if (iconUrl == null) {
-            return Hudson.RESOURCE_PATH + "/images/" + size + "/" + HEALTH_UNKNOWN;
+            return Jenkins.RESOURCE_PATH + "/images/" + size + "/" + HEALTH_UNKNOWN;
         }
         if (iconUrl.startsWith("/")) {
             return iconUrl.replace("/32x32/", "/" + size + "/");
         }
-        return Hudson.RESOURCE_PATH + "/images/" + size + "/" + iconUrl;
+        return Jenkins.RESOURCE_PATH + "/images/" + size + "/" + iconUrl;
     }
 
     /**
@@ -316,42 +318,6 @@ public class HealthReport implements Serializable, Comparable<HealthReport> {
                 hr.localizibleDescription = new NonLocalizable(hr.description == null ? "" : hr.description);
                 OldDataMonitor.report(context, "1.256");
             }
-        }
-    }
-
-    /**
-     * In order to provide backwards compatibility, we use this crazy class to fake out localization.
-     */
-    private static class NonLocalizable extends Localizable {
-        /**
-         * The string that we don't know how to localize
-         */
-        private final String nonLocalizable;
-
-        /**
-         * Creates a non-localizable string.
-         *
-         * @param nonLocalizable the string.
-         */
-        public NonLocalizable(String nonLocalizable) {
-            super(null, null);
-            this.nonLocalizable = nonLocalizable;
-        }
-
-        /**
-         * {@inheritDoc}
-         */
-        @Override
-        public String toString(Locale locale) {
-            return nonLocalizable;
-        }
-
-        /**
-         * {@inheritDoc}
-         */
-        @Override
-        public String toString() {
-            return nonLocalizable;
         }
     }
 }

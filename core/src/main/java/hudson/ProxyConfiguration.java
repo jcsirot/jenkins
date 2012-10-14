@@ -23,7 +23,11 @@
  */
 package hudson;
 
-import hudson.model.Hudson;
+import com.google.common.collect.Lists;
+import hudson.model.AbstractDescribableImpl;
+import hudson.model.Descriptor;
+import hudson.util.FormValidation;
+import jenkins.model.Jenkins;
 import hudson.model.Saveable;
 import hudson.model.listeners.SaveableListener;
 import hudson.util.Scrambler;
@@ -32,6 +36,7 @@ import hudson.util.XStream2;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.Serializable;
 import java.net.Authenticator;
 import java.net.InetSocketAddress;
 import java.net.PasswordAuthentication;
@@ -40,6 +45,14 @@ import java.net.URL;
 import java.net.URLConnection;
 
 import com.thoughtworks.xstream.XStream;
+import java.io.InputStream;
+import java.util.Collections;
+import java.util.List;
+import java.util.regex.Pattern;
+
+import org.jvnet.robust_http_client.RetryableHttpStream;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.QueryParameter;
 
 /**
  * HTTP proxy configuration.
@@ -53,9 +66,9 @@ import com.thoughtworks.xstream.XStream;
  * <a href="http://java.sun.com/javase/6/docs/technotes/guides/net/http-auth.html">
  * Http Authentication</a>).
  * 
- * @see Hudson#proxy
+ * @see jenkins.model.Jenkins#proxy
  */
-public final class ProxyConfiguration implements Saveable {
+public final class ProxyConfiguration extends AbstractDescribableImpl<ProxyConfiguration> implements Saveable, Serializable {
     public final String name;
     public final int port;
 
@@ -65,8 +78,12 @@ public final class ProxyConfiguration implements Saveable {
     private final String userName;
 
     /**
-     * null
+     * List of host names that shouldn't use proxy, as typed by users.
+     *
+     * @see #getNoProxyHostPatterns() 
      */
+    public final String noProxyHost;
+
     @Deprecated
     private String password;
 
@@ -80,10 +97,16 @@ public final class ProxyConfiguration implements Saveable {
     }
 
     public ProxyConfiguration(String name, int port, String userName, String password) {
-        this.name = name;
+        this(name,port,userName,password,null);
+    }
+
+    @DataBoundConstructor
+    public ProxyConfiguration(String name, int port, String userName, String password, String noProxyHost) {
+        this.name = Util.fixEmptyAndTrim(name);
         this.port = port;
-        this.userName = userName;
+        this.userName = Util.fixEmptyAndTrim(userName);
         this.secretPassword = Secret.fromString(password);
+        this.noProxyHost = Util.fixEmptyAndTrim(noProxyHost);
     }
 
     public String getUserName() {
@@ -103,7 +126,46 @@ public final class ProxyConfiguration implements Saveable {
         return (secretPassword == null) ? null : secretPassword.getEncryptedValue();
     }
 
+    /**
+     * Returns the list of properly formatted no proxy host names.
+     */
+    public List<Pattern> getNoProxyHostPatterns() {
+        return getNoProxyHostPatterns(noProxyHost);
+    }
+
+    /**
+     * Returns the list of properly formatted no proxy host names.
+     */
+    public static List<Pattern> getNoProxyHostPatterns(String noProxyHost) {
+        if (noProxyHost==null)  return Collections.emptyList();
+
+        List<Pattern> r = Lists.newArrayList();
+        for (String s : noProxyHost.split("[ \t\n,|]+")) {
+            if (s.length()==0)  continue;
+            r.add(Pattern.compile(s.replace(".", "\\.").replace("*", ".*")));
+        }
+        return r;
+    }
+
+    /**
+     * @deprecated
+     *      Use {@link #createProxy(String)}
+     */
     public Proxy createProxy() {
+        return createProxy(null);
+    }
+
+    public Proxy createProxy(String host) {
+        return createProxy(host, name, port, noProxyHost);
+    }
+
+    public static Proxy createProxy(String host, String name, int port, String noProxyHost) {
+        if (host!=null && noProxyHost!=null) {
+            for (Pattern p : getNoProxyHostPatterns(noProxyHost)) {
+                if (p.matcher(host).matches())
+                    return Proxy.NO_PROXY;
+            }
+        }
         return new Proxy(Proxy.Type.HTTP, new InetSocketAddress(name,port));
     }
 
@@ -123,7 +185,7 @@ public final class ProxyConfiguration implements Saveable {
     }
 
     public static XmlFile getXmlFile() {
-        return new XmlFile(XSTREAM, new File(Hudson.getInstance().getRootDir(), "proxy.xml"));
+        return new XmlFile(XSTREAM, new File(Jenkins.getInstance().getRootDir(), "proxy.xml"));
     }
 
     public static ProxyConfiguration load() throws IOException {
@@ -138,30 +200,85 @@ public final class ProxyConfiguration implements Saveable {
      * This method should be used wherever {@link URL#openConnection()} to internet URLs is invoked directly.
      */
     public static URLConnection open(URL url) throws IOException {
-        Hudson h = Hudson.getInstance(); // this code might run on slaves
+        Jenkins h = Jenkins.getInstance(); // this code might run on slaves
         ProxyConfiguration p = h!=null ? h.proxy : null;
         if(p==null)
             return url.openConnection();
 
-        URLConnection con = url.openConnection(p.createProxy());
+        URLConnection con = url.openConnection(p.createProxy(url.getHost()));
         if(p.getUserName()!=null) {
         	// Add an authenticator which provides the credentials for proxy authentication
             Authenticator.setDefault(new Authenticator() {
                 @Override
                 public PasswordAuthentication getPasswordAuthentication() {
                     if (getRequestorType()!=RequestorType.PROXY)    return null;
-                    ProxyConfiguration p = Hudson.getInstance().proxy;
+                    ProxyConfiguration p = Jenkins.getInstance().proxy;
                     return new PasswordAuthentication(p.getUserName(),
                             p.getPassword().toCharArray());
                 }
             });
         }
+
+        for (URLConnectionDecorator d : URLConnectionDecorator.all())
+            d.decorate(con);
+
         return con;
+    }
+    
+    public static InputStream getInputStream(URL url) throws IOException {
+        Jenkins h = Jenkins.getInstance(); // this code might run on slaves
+        final ProxyConfiguration p = (h != null) ? h.proxy : null;
+        if (p == null) 
+            return new RetryableHttpStream(url);
+
+        InputStream is = new RetryableHttpStream(url, p.createProxy(url.getHost()));
+        if (p.getUserName() != null) {
+            // Add an authenticator which provides the credentials for proxy authentication
+            Authenticator.setDefault(new Authenticator() {
+
+                @Override
+                public PasswordAuthentication getPasswordAuthentication() {
+                    if (getRequestorType() != RequestorType.PROXY) {
+                        return null;
+                    }
+                    return new PasswordAuthentication(p.getUserName(), p.getPassword().toCharArray());
+                }
+            });
+        }
+        
+        return is;
     }
 
     private static final XStream XSTREAM = new XStream2();
 
+    private static final long serialVersionUID = 1L;
+
     static {
         XSTREAM.alias("proxy", ProxyConfiguration.class);
+    }
+
+    @Extension
+    public static class DescriptorImpl extends Descriptor<ProxyConfiguration> {
+        @Override
+        public String getDisplayName() {
+            return "Proxy Configuration";
+        }
+
+        public FormValidation doCheckPort(@QueryParameter String value) {
+            value = Util.fixEmptyAndTrim(value);
+            if (value == null) {
+                return FormValidation.ok();
+            }
+            int port;
+            try {
+                port = Integer.parseInt(value);
+            } catch (NumberFormatException e) {
+                return FormValidation.error(Messages.PluginManager_PortNotANumber());
+            }
+            if (port < 0 || port > 65535) {
+                return FormValidation.error(Messages.PluginManager_PortNotInRange(0, 65535));
+            }
+            return FormValidation.ok();
+        }
     }
 }

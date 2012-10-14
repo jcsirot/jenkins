@@ -27,7 +27,7 @@ import hudson.EnvVars;
 import hudson.Util;
 import hudson.Extension;
 import hudson.model.Descriptor;
-import hudson.model.Hudson;
+import jenkins.model.Jenkins;
 import hudson.model.TaskListener;
 import hudson.remoting.Channel;
 import hudson.util.StreamCopyThread;
@@ -97,9 +97,10 @@ public class CommandLauncher extends ComputerLauncher {
             ProcessBuilder pb = new ProcessBuilder(Util.tokenize(getCommand()));
             final EnvVars cookie = _cookie = EnvVars.createCookie();
             pb.environment().putAll(cookie);
+            pb.environment().put("WORKSPACE", computer.getNode().getRemoteFS()); //path for local slave log
 
             {// system defined variables
-                String rootUrl = Hudson.getInstance().getRootUrl();
+                String rootUrl = Jenkins.getInstance().getRootUrl();
                 if (rootUrl!=null) {
                     pb.environment().put("HUDSON_URL", rootUrl);    // for backward compatibility
                     pb.environment().put("JENKINS_URL", rootUrl);

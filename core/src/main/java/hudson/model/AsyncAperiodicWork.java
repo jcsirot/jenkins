@@ -30,6 +30,8 @@ import java.io.File;
 import java.io.IOException;
 import java.util.logging.Level;
 
+import jenkins.model.Jenkins;
+import org.acegisecurity.context.SecurityContext;
 import org.acegisecurity.context.SecurityContextHolder;
 
 /**
@@ -69,8 +71,8 @@ public abstract class AsyncAperiodicWork extends AperiodicWork {
 
                     StreamTaskListener l = createListener();
                     try {
-                        SecurityContextHolder.getContext().setAuthentication(ACL.SYSTEM);
-                        
+                        ACL.impersonate(ACL.SYSTEM);
+
                         execute(l);
                     } catch (IOException e) {
                         e.printStackTrace(l.fatalError(e.getMessage()));
@@ -102,7 +104,7 @@ public abstract class AsyncAperiodicWork extends AperiodicWork {
      * Determines the log file that records the result of this task.
      */
     protected File getLogFile() {
-        return new File(Hudson.getInstance().getRootDir(),name+".log");
+        return new File(Jenkins.getInstance().getRootDir(),name+".log");
     }
 
     /**

@@ -26,6 +26,7 @@ package hudson.model;
 
 import hudson.EnvVars;
 import hudson.Util;
+import hudson.model.queue.SubTask;
 import hudson.scm.SCM;
 import hudson.tasks.BuildWrapper;
 import hudson.tasks.Builder;
@@ -255,5 +256,21 @@ public abstract class ParameterValue implements Serializable {
      */
     public boolean isSensitive() {
         return false;
-}
+    }
+
+    /**
+     * Controls where the build (that this parameter is submitted to) will happen.
+     *
+     * @return
+     *      null to run the build where it normally runs. If non-null, this will
+     *      override {@link AbstractProject#getAssignedLabel()}. If a build is
+     *      submitted with multiple parameters, the first one that returns non-null
+     *      from this method will win, and all others won't be consulted.
+     *
+     *
+     * @since 1.414
+     */
+    public Label getAssignedLabel(SubTask task) {
+        return null;
+    }
 }

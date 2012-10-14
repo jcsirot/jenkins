@@ -25,50 +25,43 @@
 
 package hudson.model;
 
-import hudson.PluginWrapper;
 import hudson.PluginManager;
-import hudson.model.UpdateCenter.UpdateCenterJob;
+import hudson.PluginWrapper;
 import hudson.lifecycle.Lifecycle;
+import hudson.model.UpdateCenter.UpdateCenterJob;
+import hudson.util.FormValidation;
+import hudson.util.FormValidation.Kind;
+import hudson.util.HttpResponses;
 import hudson.util.IOUtils;
 import hudson.util.TextFile;
 import hudson.util.VersionNumber;
-import static hudson.util.TimeUnit2.DAYS;
+import jenkins.model.Jenkins;
+import jenkins.util.JSONSignatureValidator;
+import net.sf.json.JSONException;
 import net.sf.json.JSONObject;
-import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.HttpResponse;
 import org.kohsuke.stapler.StaplerRequest;
-import org.kohsuke.stapler.StaplerResponse;
-import org.jvnet.hudson.crypto.CertificateUtil;
-import org.jvnet.hudson.crypto.SignatureOutputStream;
-import org.apache.commons.io.output.NullOutputStream;
-import org.apache.commons.io.output.TeeOutputStream;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.stapler.interceptor.RequirePOST;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.ByteArrayInputStream;
-import java.io.OutputStreamWriter;
+import java.net.URI;
+import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeMap;
-import java.util.HashMap;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.Future;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import java.security.GeneralSecurityException;
-import java.security.MessageDigest;
-import java.security.DigestOutputStream;
-import java.security.Signature;
-import java.security.cert.X509Certificate;
-import java.security.cert.CertificateFactory;
-import java.security.cert.TrustAnchor;
 
-import com.trilead.ssh2.crypto.Base64;
-
-import javax.servlet.ServletContext;
+import static hudson.util.TimeUnit2.*;
 
 
 /**
@@ -82,6 +75,7 @@ import javax.servlet.ServletContext;
  * @author Kohsuke Kawaguchi
  * @since 1.333
  */
+@ExportedBean
 public class UpdateSite {
     /**
      * What's the time stamp of data file?
@@ -97,6 +91,22 @@ public class UpdateSite {
      * all at once.
      */
     private transient volatile long lastAttempt = -1;
+
+    /**
+     * If the attempt to fetch data fails, we progressively use longer time out before retrying,
+     * to avoid overloading the server.
+     */
+    private transient volatile long retryWindow;
+
+    /**
+     * lastModified time of the data file when it was last read.
+     */
+    private transient long dataLastReadFromFile;
+
+    /**
+     * Latest data as read from the data file.
+     */
+    private Data data;
 
     /**
      * ID string for this update source.
@@ -124,10 +134,12 @@ public class UpdateSite {
     /**
      * Get ID string.
      */
+    @Exported
     public String getId() {
         return id;
     }
 
+    @Exported
     public long getDataTimestamp() {
         return dataTimestamp;
     }
@@ -135,81 +147,38 @@ public class UpdateSite {
     /**
      * This is the endpoint that receives the update center data file from the browser.
      */
-    public void doPostBack(StaplerRequest req, StaplerResponse rsp) throws IOException, GeneralSecurityException {
+    public FormValidation doPostBack(StaplerRequest req) throws IOException, GeneralSecurityException {
         dataTimestamp = System.currentTimeMillis();
         String json = IOUtils.toString(req.getInputStream(),"UTF-8");
         JSONObject o = JSONObject.fromObject(json);
 
         int v = o.getInt("updateCenterVersion");
-        if(v !=1) {
-            LOGGER.warning("Unrecognized update center version: "+v);
-            return;
+        if(v !=1)
+            throw new IllegalArgumentException("Unrecognized update center version: "+v);
+
+        if (signatureCheck) {
+            FormValidation e = verifySignature(o);
+            if (e.kind!=Kind.OK) {
+                LOGGER.severe(e.renderHtml());
+                return e;
+            }
         }
 
-        if (signatureCheck)
-            verifySignature(o);
-
         LOGGER.info("Obtained the latest update center data file for UpdateSource " + id);
+        retryWindow = 0;
         getDataFile().write(json);
-        rsp.setContentType("text/plain");  // So browser won't try to parse response
+        return FormValidation.ok();
+    }
+
+    public FormValidation doVerifySignature() throws IOException {
+        return verifySignature(getJSONObject());
     }
 
     /**
      * Verifies the signature in the update center data file.
      */
-    private boolean verifySignature(JSONObject o) throws GeneralSecurityException, IOException {
-        JSONObject signature = o.getJSONObject("signature");
-        if (signature.isNullObject()) {
-            LOGGER.severe("No signature block found");
-            return false;
-        }
-        o.remove("signature");
-
-        List<X509Certificate> certs = new ArrayList<X509Certificate>();
-        {// load and verify certificates
-            CertificateFactory cf = CertificateFactory.getInstance("X509");
-            for (Object cert : signature.getJSONArray("certificates")) {
-                X509Certificate c = (X509Certificate) cf.generateCertificate(new ByteArrayInputStream(Base64.decode(cert.toString().toCharArray())));
-                c.checkValidity();
-                certs.add(c);
-            }
-
-            // all default root CAs in JVM are trusted, plus certs bundled in Jenkins
-            Set<TrustAnchor> anchors = new HashSet<TrustAnchor>(); // CertificateUtil.getDefaultRootCAs();
-            ServletContext context = Hudson.getInstance().servletContext;
-            for (String cert : (Set<String>) context.getResourcePaths("/WEB-INF/update-center-rootCAs")) {
-                if (cert.endsWith(".txt"))  continue;       // skip text files that are meant to be documentation
-                anchors.add(new TrustAnchor((X509Certificate)cf.generateCertificate(context.getResourceAsStream(cert)),null));
-            }
-            CertificateUtil.validatePath(certs,anchors);
-        }
-
-        // this is for computing a digest to check sanity
-        MessageDigest sha1 = MessageDigest.getInstance("SHA1");
-        DigestOutputStream dos = new DigestOutputStream(new NullOutputStream(),sha1);
-
-        // this is for computing a signature
-        Signature sig = Signature.getInstance("SHA1withRSA");
-        sig.initVerify(certs.get(0));
-        SignatureOutputStream sos = new SignatureOutputStream(sig);
-
-        o.writeCanonical(new OutputStreamWriter(new TeeOutputStream(dos,sos),"UTF-8"));
-
-        // did the digest match? this is not a part of the signature validation, but if we have a bug in the c14n
-        // (which is more likely than someone tampering with update center), we can tell
-        String computedDigest = new String(Base64.encode(sha1.digest()));
-        String providedDigest = signature.getString("digest");
-        if (!computedDigest.equalsIgnoreCase(providedDigest)) {
-            LOGGER.severe("Digest mismatch: "+computedDigest+" vs "+providedDigest);
-            return false;
-        }
-
-        if (!sig.verify(Base64.decode(signature.getString("signature").toCharArray()))) {
-            LOGGER.severe("Signature in the update center doesn't match with the certificate");
-            return false;
-        }
-
-        return true;
+    private FormValidation verifySignature(JSONObject o) throws IOException {
+        return new JSONSignatureValidator("update site '"+id+"'").verifySignature(o);
     }
 
     /**
@@ -220,21 +189,60 @@ public class UpdateSite {
         if(dataTimestamp==-1)
             dataTimestamp = getDataFile().file.lastModified();
         long now = System.currentTimeMillis();
-        boolean due = now - dataTimestamp > DAY && now - lastAttempt > 15000;
-        if(due)     lastAttempt = now;
+        
+        retryWindow = Math.max(retryWindow,SECONDS.toMillis(15));
+        
+        boolean due = now - dataTimestamp > DAY && now - lastAttempt > retryWindow;
+        if(due) {
+            lastAttempt = now;
+            retryWindow = Math.min(retryWindow*2, HOURS.toMillis(1)); // exponential back off but at most 1 hour
+        }
         return due;
     }
 
     /**
-     * Loads the update center data, if any.
+     * Invalidates the cached data and force retrieval.
+     *
+     * @since 1.432
+     */
+    @RequirePOST
+    public HttpResponse doInvalidateData() {
+        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);
+        dataTimestamp = 0;
+        return HttpResponses.ok();
+    }
+
+    /**
+     * Loads the update center data, if any and if modified since last read.
      *
      * @return  null if no data is available.
      */
     public Data getData() {
         TextFile df = getDataFile();
+        if (df.exists() && dataLastReadFromFile != df.file.lastModified()) {
+            JSONObject o = getJSONObject();
+            if (o!=null) {
+                data = new Data(o);
+                dataLastReadFromFile = df.file.lastModified();
+            } else {
+                data = null;
+            }
+        }
+        return data;
+    }
+
+    /**
+     * Gets the raw update center JSON data.
+     */
+    public JSONObject getJSONObject() {
+        TextFile df = getDataFile();
         if(df.exists()) {
             try {
-                return new Data(JSONObject.fromObject(df.read()));
+                return JSONObject.fromObject(df.read());
+            } catch (JSONException e) {
+                LOGGER.log(Level.SEVERE,"Failed to parse "+df,e);
+                df.delete(); // if we keep this file, it will cause repeated failures
+                return null;
             } catch (IOException e) {
                 LOGGER.log(Level.SEVERE,"Failed to parse "+df,e);
                 df.delete(); // if we keep this file, it will cause repeated failures
@@ -244,11 +252,12 @@ public class UpdateSite {
             return null;
         }
     }
-    
+
     /**
      * Returns a list of plugins that should be shown in the "available" tab.
      * These are "all plugins - installed plugins".
      */
+    @Exported
     public List<Plugin> getAvailables() {
         List<Plugin> r = new ArrayList<Plugin>();
         Data data = getData();
@@ -275,9 +284,14 @@ public class UpdateSite {
         return dt.plugins.get(artifactId);
     }
 
+    public Api getApi() {
+        return new Api(this);
+    }
+
     /**
      * Returns an "always up" server for Internet connectivity testing, or null if we are going to skip the test.
      */
+    @Exported
     public String getConnectionCheckUrl() {
         Data dt = getData();
         if(dt==null)    return "http://www.google.com/";
@@ -288,7 +302,7 @@ public class UpdateSite {
      * This is where we store the update center data.
      */
     private TextFile getDataFile() {
-        return new TextFile(new File(Hudson.getInstance().getRootDir(),
+        return new TextFile(new File(Jenkins.getInstance().getRootDir(),
                                      "updates/" + getId()+".json"));
     }
     
@@ -298,12 +312,13 @@ public class UpdateSite {
      * @return
      *      can be empty but never null.
      */
+    @Exported
     public List<Plugin> getUpdates() {
         Data data = getData();
         if(data==null)      return Collections.emptyList(); // fail to determine
         
         List<Plugin> r = new ArrayList<Plugin>();
-        for (PluginWrapper pw : Hudson.getInstance().getPluginManager().getPlugins()) {
+        for (PluginWrapper pw : Jenkins.getInstance().getPluginManager().getPlugins()) {
             Plugin p = pw.getUpdateInfo();
             if(p!=null) r.add(p);
         }
@@ -314,11 +329,12 @@ public class UpdateSite {
     /**
      * Does any of the plugin has updates?
      */
+    @Exported
     public boolean hasUpdates() {
         Data data = getData();
         if(data==null)      return false;
         
-        for (PluginWrapper pw : Hudson.getInstance().getPluginManager().getPlugins()) {
+        for (PluginWrapper pw : Jenkins.getInstance().getPluginManager().getPlugins()) {
             if(!pw.isBundled() && pw.getUpdateInfo()!=null)
                 // do not advertize updates to bundled plugins, since we generally want users to get them
                 // as a part of jenkins.war updates. This also avoids unnecessary pinning of plugins. 
@@ -332,7 +348,30 @@ public class UpdateSite {
      * Exposed to get rid of hardcoding of the URL that serves up update-center.json
      * in Javascript.
      */
+    @Exported
     public String getUrl() {
+        return url;
+    }
+
+    /**
+     * Where to actually download the update center?
+     *
+     * @deprecated
+     *      Exposed only for UI.
+     */
+    public String getDownloadUrl() {
+        /*
+            HACKISH:
+
+            Loading scripts in HTTP from HTTPS pages cause browsers to issue a warning dialog.
+            The elegant way to solve the problem is to always load update center from HTTPS,
+            but our backend mirroring scheme isn't ready for that. So this hack serves regular
+            traffic in HTTP server, and only use HTTPS update center for Jenkins in HTTPS.
+
+            We'll monitor the traffic to see if we can sustain this added traffic.
+         */
+        if (url.equals("http://updates.jenkins-ci.org/update-center.json") && Jenkins.getInstance().isRootUrlSecure())
+            return "https"+url.substring(4);
         return url;
     }
 
@@ -340,7 +379,7 @@ public class UpdateSite {
      * Is this the legacy default update center site?
      */
     public boolean isLegacyDefault() {
-        return id.equals("default") && url.startsWith("http://hudson-ci.org/") || url.startsWith("http://updates.hudson-labs.org/");
+        return id.equals(UpdateCenter.ID_DEFAULT) && url.startsWith("http://hudson-ci.org/") || url.startsWith("http://updates.hudson-labs.org/");
     }
 
     /**
@@ -369,8 +408,8 @@ public class UpdateSite {
 
         Data(JSONObject o) {
             this.sourceId = (String)o.get("id");
-            if (sourceId.equals("default")) {
-                core = new Entry(sourceId, o.getJSONObject("core"));
+            if (sourceId.equals(UpdateCenter.ID_DEFAULT)) {
+                core = new Entry(sourceId, o.getJSONObject("core"), url);
             }
             else {
                 core = null;
@@ -386,7 +425,7 @@ public class UpdateSite {
          * Is there a new version of the core?
          */
         public boolean hasCoreUpdates() {
-            return core != null && core.isNewerThan(Hudson.VERSION);
+            return core != null && core.isNewerThan(Jenkins.VERSION);
         }
 
         /**
@@ -397,30 +436,46 @@ public class UpdateSite {
         }
     }
 
+    @ExportedBean
     public static class Entry {
         /**
          * {@link UpdateSite} ID.
          */
+        @Exported
         public final String sourceId;
 
         /**
          * Artifact ID.
          */
+        @Exported
         public final String name;
         /**
          * The version.
          */
+        @Exported
         public final String version;
         /**
          * Download URL.
          */
+        @Exported
         public final String url;
 
         public Entry(String sourceId, JSONObject o) {
+            this(sourceId, o, null);
+        }
+
+        Entry(String sourceId, JSONObject o, String baseURL) {
             this.sourceId = sourceId;
             this.name = o.getString("name");
             this.version = o.getString("version");
-            this.url = o.getString("url");
+            String url = o.getString("url");
+            if (!URI.create(url).isAbsolute()) {
+                if (baseURL == null) {
+                    throw new IllegalArgumentException("Cannot resolve " + url + " without a base URL");
+                }
+                url = URI.create(baseURL).resolve(url).toString();
+            }
+            this.url = url;
         }
 
         /**
@@ -441,12 +496,17 @@ public class UpdateSite {
             }
         }
 
+        public Api getApi() {
+            return new Api(this);
+        }
+
     }
 
     public final class Plugin extends Entry {
         /**
          * Optional URL to the Wiki page that discusses this plugin.
          */
+        @Exported
         public final String wiki;
         /**
          * Human readable title of the plugin, taken from Wiki page.
@@ -455,33 +515,39 @@ public class UpdateSite {
          * <p>
          * beware of XSS vulnerability since this data comes from Wiki
          */
+        @Exported
         public final String title;
         /**
          * Optional excerpt string.
          */
+        @Exported
         public final String excerpt;
         /**
          * Optional version # from which this plugin release is configuration-compatible.
          */
+        @Exported
         public final String compatibleSinceVersion;
         /**
          * Version of Jenkins core this plugin was compiled against.
          */
+        @Exported
         public final String requiredCore;
         /**
          * Categories for grouping plugins, taken from labels assigned to wiki page.
          * Can be null.
          */
+        @Exported
         public final String[] categories;
 
         /**
          * Dependencies of this plugin.
          */
+        @Exported
         public final Map<String,String> dependencies = new HashMap<String,String>();
         
         @DataBoundConstructor
         public Plugin(String sourceId, JSONObject o) {
-            super(sourceId, o);
+            super(sourceId, o, UpdateSite.this.url);
             this.wiki = get(o,"wiki");
             this.title = get(o,"title");
             this.excerpt = get(o,"excerpt");
@@ -518,8 +584,9 @@ public class UpdateSite {
          * If some version of this plugin is currently installed, return {@link PluginWrapper}.
          * Otherwise null.
          */
+        @Exported
         public PluginWrapper getInstalled() {
-            PluginManager pm = Hudson.getInstance().getPluginManager();
+            PluginManager pm = Jenkins.getInstance().getPluginManager();
             return pm.getPlugin(name);
         }
 
@@ -530,6 +597,7 @@ public class UpdateSite {
          * If it's not older, or it's not installed, or it's installed but there's no compatibleSinceVersion
          * specified, it'll return true.
          */
+        @Exported
         public boolean isCompatibleWithInstalledVersion() {
             PluginWrapper installedVersion = getInstalled();
             if (installedVersion != null) {
@@ -546,11 +614,16 @@ public class UpdateSite {
         /**
          * Returns a list of dependent plugins which need to be installed or upgraded for this plugin to work.
          */
+        @Exported
         public List<Plugin> getNeededDependencies() {
             List<Plugin> deps = new ArrayList<Plugin>();
 
             for(Map.Entry<String,String> e : dependencies.entrySet()) {
-                Plugin depPlugin = Hudson.getInstance().getUpdateCenter().getPlugin(e.getKey());
+                Plugin depPlugin = Jenkins.getInstance().getUpdateCenter().getPlugin(e.getKey());
+                if (depPlugin == null) {
+                    LOGGER.log(Level.WARNING, "Could not find dependency {0} of {1}", new Object[] {e.getKey(), name});
+                    continue;
+                }
                 VersionNumber requiredVersion = new VersionNumber(e.getValue());
                 
                 // Is the plugin installed already? If not, add it.
@@ -572,7 +645,7 @@ public class UpdateSite {
         public boolean isForNewerHudson() {
             try {
                 return requiredCore!=null && new VersionNumber(requiredCore).isNewerThan(
-                  new VersionNumber(Hudson.VERSION.replaceFirst("SHOT *\\(private.*\\)", "SHOT")));
+                  new VersionNumber(Jenkins.VERSION.replaceFirst("SHOT *\\(private.*\\)", "SHOT")));
             } catch (NumberFormatException nfe) {
                 return true;  // If unable to parse version
             }
@@ -586,45 +659,61 @@ public class UpdateSite {
             deploy();
         }
 
+        public Future<UpdateCenterJob> deploy() {
+            return deploy(false);
+        }
+
         /**
          * Schedules the installation of this plugin.
          *
          * <p>
          * This is mainly intended to be called from the UI. The actual installation work happens
          * asynchronously in another thread.
+         *
+         * @param dynamicLoad
+         *      If true, the plugin will be dynamically loaded into this Jenkins. If false,
+         *      the plugin will only take effect after the reboot.
          */
-        public Future<UpdateCenterJob> deploy() {
-            Hudson.getInstance().checkPermission(Hudson.ADMINISTER);
-            UpdateCenter uc = Hudson.getInstance().getUpdateCenter();
+        public Future<UpdateCenterJob> deploy(boolean dynamicLoad) {
+            Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);
+            UpdateCenter uc = Jenkins.getInstance().getUpdateCenter();
             for (Plugin dep : getNeededDependencies()) {
                 LOGGER.log(Level.WARNING, "Adding dependent install of " + dep.name + " for plugin " + name);
-                dep.deploy();
+                dep.deploy(dynamicLoad);
             }
-            return uc.addJob(uc.new InstallationJob(this, UpdateSite.this, Hudson.getAuthentication()));
+            return uc.addJob(uc.new InstallationJob(this, UpdateSite.this, Jenkins.getAuthentication(), dynamicLoad));
         }
 
         /**
          * Schedules the downgrade of this plugin.
          */
         public Future<UpdateCenterJob> deployBackup() {
-            Hudson.getInstance().checkPermission(Hudson.ADMINISTER);
-            UpdateCenter uc = Hudson.getInstance().getUpdateCenter();
-            return uc.addJob(uc.new PluginDowngradeJob(this, UpdateSite.this, Hudson.getAuthentication()));
+            Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);
+            UpdateCenter uc = Jenkins.getInstance().getUpdateCenter();
+            return uc.addJob(uc.new PluginDowngradeJob(this, UpdateSite.this, Jenkins.getAuthentication()));
         }
         /**
          * Making the installation web bound.
          */
-        public void doInstall(StaplerResponse rsp) throws IOException {
-            deploy();
-            rsp.sendRedirect2("../..");
+        @RequirePOST
+        public HttpResponse doInstall() throws IOException {
+            deploy(false);
+            return HttpResponses.redirectTo("../..");
+        }
+
+        @RequirePOST
+        public HttpResponse doInstallNow() throws IOException {
+            deploy(true);
+            return HttpResponses.redirectTo("../..");
         }
 
         /**
          * Performs the downgrade of the plugin.
          */
-        public void doDowngrade(StaplerResponse rsp) throws IOException {
+        @RequirePOST
+        public HttpResponse doDowngrade() throws IOException {
             deployBackup();
-            rsp.sendRedirect2("../..");
+            return HttpResponses.redirectTo("../..");
         }
     }
 
@@ -638,5 +727,5 @@ public class UpdateSite {
     /**
      * Off by default until we know this is reasonably working.
      */
-    public static boolean signatureCheck = Boolean.getBoolean(UpdateCenter.class.getName()+".signatureCheck");
+    public static boolean signatureCheck = true; // Boolean.getBoolean(UpdateCenter.class.getName()+".signatureCheck");
 }

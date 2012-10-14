@@ -57,6 +57,7 @@ import java.util.Set;
 
 import javax.servlet.ServletException;
 
+import jenkins.model.Jenkins;
 import org.apache.commons.io.IOUtils;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.HttpResponse;
@@ -118,7 +119,7 @@ public abstract class Slave extends Node implements Serializable {
      */
     private String label="";
     
-    private /*almost final*/ DescribableList<NodeProperty<?>,NodePropertyDescriptor> nodeProperties = new DescribableList<NodeProperty<?>,NodePropertyDescriptor>(Hudson.getInstance());
+    private /*almost final*/ DescribableList<NodeProperty<?>,NodePropertyDescriptor> nodeProperties = new DescribableList<NodeProperty<?>,NodePropertyDescriptor>(Jenkins.getInstance());
 
     /**
      * Lazily computed set of labels from {@link #label}.
@@ -216,6 +217,13 @@ public abstract class Slave extends Node implements Serializable {
         return Util.fixNull(label).trim();
     }
 
+    @Override
+    public void setLabelString(String labelString) throws IOException {
+        this.label = Util.fixNull(labelString).trim();
+        // Compute labels now.
+        getAssignedLabels();
+    }
+
     public ClockDifference getClockDifference() throws IOException, InterruptedException {
         VirtualChannel channel = getChannel();
         if(channel==null)
@@ -235,7 +243,7 @@ public abstract class Slave extends Node implements Serializable {
     public FilePath getWorkspaceFor(TopLevelItem item) {
         FilePath r = getWorkspaceRoot();
         if(r==null)     return null;    // offline
-        return r.child(item.getName());
+        return r.child(item.getFullName());
     }
 
     public FilePath getRootPath() {
@@ -286,10 +294,10 @@ public abstract class Slave extends Node implements Serializable {
         public URL getURL() throws MalformedURLException {
             String name = fileName;
             if (name.equals("hudson-cli.jar"))  name="jenkins-cli.jar";
-            URL res = Hudson.getInstance().servletContext.getResource("/WEB-INF/" + name);
+            URL res = Jenkins.getInstance().servletContext.getResource("/WEB-INF/" + name);
             if(res==null) {
                 // during the development this path doesn't have the files.
-                res = new URL(new File(".").getAbsoluteFile().toURI().toURL(),"target/generated-resources/WEB-INF/"+name);
+                res = new URL(new File(".").getAbsoluteFile().toURI().toURL(),"target/jenkins/WEB-INF/"+name);
             }
             return res;
         }
@@ -335,7 +343,7 @@ public abstract class Slave extends Node implements Serializable {
     /**
      * Invoked by XStream when this object is read into memory.
      */
-    private Object readResolve() {
+    protected Object readResolve() {
         // convert the old format to the new one
         if (launcher == null) {
             launcher = (agentCommand == null || agentCommand.trim().length() == 0)
@@ -343,12 +351,12 @@ public abstract class Slave extends Node implements Serializable {
                     : new CommandLauncher(agentCommand);
         }
         if(nodeProperties==null)
-            nodeProperties = new DescribableList<NodeProperty<?>,NodePropertyDescriptor>(Hudson.getInstance());
+            nodeProperties = new DescribableList<NodeProperty<?>,NodePropertyDescriptor>(Jenkins.getInstance());
         return this;
     }
 
     public SlaveDescriptor getDescriptor() {
-        Descriptor d = Hudson.getInstance().getDescriptorOrDie(getClass());
+        Descriptor d = Jenkins.getInstance().getDescriptorOrDie(getClass());
         if (d instanceof SlaveDescriptor)
             return (SlaveDescriptor) d;
         throw new IllegalStateException(d.getClass()+" needs to extend from SlaveDescriptor");

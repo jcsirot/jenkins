@@ -23,16 +23,17 @@
  */
 package hudson.maven;
 
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Multimap;
 import hudson.CopyOnWrite;
-import hudson.Util;
 import hudson.Functions;
+import hudson.Util;
 import hudson.maven.reporters.MavenMailer;
 import hudson.model.AbstractProject;
 import hudson.model.Action;
 import hudson.model.DependencyGraph;
 import hudson.model.Descriptor;
 import hudson.model.Descriptor.FormException;
-import hudson.model.Hudson;
 import hudson.model.Item;
 import hudson.model.ItemGroup;
 import hudson.model.JDK;
@@ -42,10 +43,11 @@ import hudson.model.Node;
 import hudson.model.Resource;
 import hudson.model.Saveable;
 import hudson.tasks.LogRotator;
-import hudson.tasks.Publisher;
 import hudson.tasks.Maven.MavenInstallation;
+import hudson.tasks.Publisher;
 import hudson.util.AlternativeUiTextProvider;
 import hudson.util.DescribableList;
+import jenkins.model.Jenkins;
 import org.apache.maven.project.MavenProject;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerResponse;
@@ -54,12 +56,13 @@ import org.kohsuke.stapler.export.Exported;
 import javax.servlet.ServletException;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.HashSet;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -68,7 +71,7 @@ import java.util.logging.Logger;
  * 
  * @author Kohsuke Kawaguchi
  */
-public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBuild> implements Saveable {
+public class MavenModule extends AbstractMavenProject<MavenModule,MavenBuild> implements Saveable {
     private DescribableList<MavenReporter,Descriptor<MavenReporter>> reporters =
         new DescribableList<MavenReporter,Descriptor<MavenReporter>>(this);
 
@@ -88,11 +91,20 @@ public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBui
      * @since 1.199
      */
     private String version;
+    
+    /**
+     * Packaging type of the module.
+     * 
+     * pom, jar, maven-plugin, ejb, war, ear, rar, par or other custom types.
+     * 
+     * @since 1.425
+     */
+    private String packaging;
 
     private transient ModuleName moduleName;
 
     /**
-     * @see documentation in {@link PomInfo#relativePath}
+     * @see PomInfo#relativePath
      */
     private String relativePath;
 
@@ -184,6 +196,7 @@ public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBui
     /*package*/ void reconfigure(PomInfo pom) {
         this.displayName = pom.displayName;
         this.version = pom.version;
+        this.packaging = pom.packaging;
         this.relativePath = pom.relativePath;
         this.dependencies = pom.dependencies;
         this.children = pom.children;
@@ -201,6 +214,15 @@ public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBui
                 }
             }
         }
+    }
+    
+    /**
+     * Returns if the given POM likely describes the same module with the same dependencies.
+     * Implementation needs not be 100% accurate in the true case, but it MUST return false
+     * if is not the same.
+     */
+    public boolean isSameModule(PomInfo pom) {
+        return pom.isSimilar(this.moduleName, this.dependencies);
     }
 
     @Override
@@ -224,7 +246,7 @@ public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBui
                 if (d instanceof ModuleDependency) {
                     deps.add((ModuleDependency) d);
                 } else {
-                    deps.add(new ModuleDependency((ModuleName)d, ModuleDependency.UNKNOWN));
+                    deps.add(new ModuleDependency((ModuleName)d, ModuleDependency.UNKNOWN, false));
                 }
             }
             dependencies = deps;
@@ -304,7 +326,8 @@ public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBui
      * Gets groupId+artifactId+version as {@link ModuleDependency}.
      */
     public ModuleDependency asDependency() {
-        return new ModuleDependency(moduleName,Functions.defaulted(version,ModuleDependency.UNKNOWN));
+        return new ModuleDependency(moduleName,Functions.defaulted(version,ModuleDependency.UNKNOWN),
+                PomInfo.PACKAGING_TYPE_PLUGIN.equals(this.packaging));
     }
 
     @Override
@@ -389,7 +412,7 @@ public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBui
     }
 
     protected void buildDependencyGraph(DependencyGraph graph) {
-        if(isDisabled() || getParent().ignoreUpstremChanges())        return;
+        if(!isBuildable() || getParent().ignoreUpstremChanges())        return;
 
         MavenDependencyComputationData data = graph.getComputationalData(MavenDependencyComputationData.class);
 
@@ -399,16 +422,18 @@ public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBui
         // to emulate the old behavior that tries to identify the upstream by ignoring the version.
         // Do this by putting groupId:artifactId:UNKNOWN to the modules list, but
         // ONLY if we find a such an old MavenModule in this Jenkins instance.
-        boolean hasDependenciesWithUnknownVersion = hasDependenciesWithUnknownVersion();
+        final boolean hasDependenciesWithUnknownVersion = hasDependenciesWithUnknownVersion();
         if (data == null) {
             Map<ModuleDependency,MavenModule> modules = new HashMap<ModuleDependency,MavenModule>();
     
-            for (MavenModule m : Hudson.getInstance().getAllItems(MavenModule.class)) {
-                if(m.isDisabled())  continue;
+            for (MavenModule m : getAllMavenModules()) {
+                if(!m.isBuildable())  continue;
                 ModuleDependency moduleDependency = m.asDependency();
-                modules.put(moduleDependency,m);
+                MavenModule old = modules.get(moduleDependency);
+                MavenModule relevant = chooseMoreRelevantModule(old, m);
+                modules.put(moduleDependency, relevant);
                 if (hasDependenciesWithUnknownVersion) {
-                    modules.put(moduleDependency.withUnknownVersion(),m);
+                    modules.put(moduleDependency.withUnknownVersion(),relevant);
                 }
             }
             data = new MavenDependencyComputationData(modules);
@@ -417,7 +442,7 @@ public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBui
         } else {
             if (hasDependenciesWithUnknownVersion && !data.withUnknownVersions) {
                 // found 'old' MavenModule: add dependencies with unknown versions now
-                for (MavenModule m : Hudson.getInstance().getAllItems(MavenModule.class)) {
+                for (MavenModule m : getAllMavenModules()) {
                     if(m.isDisabled())  continue;
                     ModuleDependency moduleDependency = m.asDependency().withUnknownVersion();
                     data.allModules.put(moduleDependency,m);
@@ -426,9 +451,6 @@ public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBui
             }
         }
 
-        // In case two modules with the same name are defined, modules in the same MavenModuleSet
-        // take precedence.
-        
         // Can lead to OOME, if remembered in the computational data and there are lot big multi-module projects
         // TODO: try to use soft references to clean the heap when needed
         Map<ModuleDependency,MavenModule> myParentsModules; // = data.modulesPerParent.get(getParent());
@@ -448,23 +470,46 @@ public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBui
             //data.modulesPerParent.put(getParent(), myParentsModules);
         //}
 
-        // if the build style is the aggregator build, define dependencies against project,
-        // not module.
-        AbstractProject<?, ?> dest = getParent().isAggregatorStyleBuild() ? getParent() : this;
+        //Create a map of groupId:artifact id keys to modules for faster look ups in findMatchingDependentModule
+        Multimap<ModuleName,ModuleDependency> mapModules = data.byName();
 
         for (ModuleDependency d : dependencies) {
-            MavenModule src = myParentsModules.get(d);
+            MavenModule src;
+
+            // In case two modules with the same name are defined, modules in the same MavenModuleSet
+            // take precedence.
+            src = myParentsModules.get(d);
+
+            // otherwise we can pick the module with the highest version number (within the constraint that
+            // it satisfies 'd')
             if (src==null) {
-                src = data.allModules.get(d);
+                Collection<ModuleDependency> candidates = mapModules.get(d.getName());
+                ModuleDependency winner = d.findHighestFrom(candidates);
+                src = data.allModules.get(winner);
             }
-            
+
             if(src!=null) {
-                DependencyGraph.Dependency dep = new MavenModuleDependency(
-                        src.getParent().isAggregatorStyleBuild() ? src.getParent() : src,dest);
+                DependencyGraph.Dependency dep = new MavenModuleDependency(nodeOf(src),nodeOf(this));
                 if (!dep.pointsItself())
                     graph.addDependency(dep);
             }
         }
+    }
+
+    /**
+     * Determines the source/sink of the dependency from a module.
+     * This is because if the build is the aggregator build, we need to define dependencies against project,
+     * not module.
+     */
+    private static AbstractMavenProject<?, ?> nodeOf(MavenModule m) {
+        return m.getParent().isAggregatorStyleBuild() ? m.getParent() : m;
+    }
+    
+    /**
+     * Returns all Maven modules in this Jenkins instance.
+     */
+    protected Collection<MavenModule> getAllMavenModules() {
+        return Jenkins.getInstance().getAllItems(MavenModule.class);
     }
     
     /**
@@ -479,16 +524,91 @@ public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBui
         }
         return false;
     }
+    
+    private MavenModule chooseMoreRelevantModule(MavenModule mm1, MavenModule mm2) {
+        
+        if (mm1 == null) {
+            return mm2;
+        }
+        if (mm2 == null) {
+            return mm1;
+        }
+
+        int score = mm1.getDependencyRelevancy() - mm2.getDependencyRelevancy();
+        if (score==0) {
+            // tie breaker. this is arbitrary, but reproduceable
+            score = mm1.getParent().getFullName().compareTo(mm2.getParent().getFullName());
+        }
+        assert score!=0;
+
+        final MavenModule moreRelevant, lessRelevant;
+
+        if (score>0)    { moreRelevant = mm1; lessRelevant = mm2; }
+        else            { moreRelevant = mm2; lessRelevant = mm1; }
+
+        if (LOGGER.isLoggable(Level.FINER)) {
+            LOGGER.finer("Choosing " + moreRelevant.getParent().getName() + " over " + lessRelevant.getParent().getName()
+                    + " for module " + mm1.asDependency().getName() + ". Relevancies: " + mm1.getDependencyRelevancy() + ", " + mm2.getDependencyRelevancy());
+        }
+        return moreRelevant;
+    }
+
+    /**
+     * As a guide for automatic dependency computation,
+     * determine how much this particular build is "relevant" to other builds on this Jenkins.
+     *
+     * If the binary is being deployed, we assume the user intends the result of this build be used elsewhere,
+     * so we give a higher score.
+     */
+    private int getDependencyRelevancy() {
+        int relevancy = 0;
+        
+        for (String goal : Util.tokenize(getGoals())) {
+            if ("deploy".equals(goal) || "deploy:deploy".equals(goal)) {
+                return 2;
+            }
+            
+            if ("install".equals(goal)) {
+                relevancy = 1;
+            }
+        }
+        
+        for (Publisher publisher : getParent().getPublishers()) {
+            if (publisher instanceof RedeployPublisher) {
+                return 2;
+            }
+        }
+        
+        return relevancy;
+    }
 
     private static class MavenDependencyComputationData {
         boolean withUnknownVersions = false;
-        Map<ModuleDependency,MavenModule> allModules;
+        /**
+         * All {@link MavenModule}s in this Jenkins, keyed by their {@link MavenModule#asDependency()}.
+         */
+        private final Map<ModuleDependency,MavenModule> allModules;
         
         //Map<MavenModuleSet, Map<ModuleDependency,MavenModule>> modulesPerParent = new HashMap<MavenModuleSet, Map<ModuleDependency,MavenModule>>();
         
-        public MavenDependencyComputationData(
-                Map<ModuleDependency, MavenModule> modules) {
+        public MavenDependencyComputationData(Map<ModuleDependency, MavenModule> modules) {
             this.allModules = modules;
+        }
+
+        /**
+         * Builds a map of all the modules, keyed against the groupId and artifactId. The values are a list of modules
+         * that match this criteria.
+         *
+         * @return {@link #allModules} keyed by their {@linkplain ModuleName names}.
+         */
+        private Multimap<ModuleName,ModuleDependency> byName() {
+            Multimap<ModuleName,ModuleDependency> map = HashMultimap.create();
+
+            for (ModuleDependency dependency : allModules.keySet()) {
+                map.put(dependency.getName(),dependency);
+            }
+
+            return map;
         }
     }
 
@@ -529,7 +649,7 @@ public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBui
         goals = Util.fixEmpty(req.getParameter("goals").trim());
 
         // dependency setting might have been changed by the user, so rebuild.
-        Hudson.getInstance().rebuildDependencyGraph();
+        Jenkins.getInstance().rebuildDependencyGraph();
     }
 
     @Override
@@ -566,5 +686,5 @@ public final class MavenModule extends AbstractMavenProject<MavenModule,MavenBui
     }
 
     private static final Logger LOGGER = Logger.getLogger(MavenModule.class.getName());
-    
+
 }

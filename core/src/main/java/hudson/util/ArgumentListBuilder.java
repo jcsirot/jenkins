@@ -24,6 +24,7 @@
  */
 package hudson.util;
 
+import hudson.Launcher;
 import hudson.Util;
 
 import java.util.ArrayList;
@@ -43,7 +44,7 @@ import java.util.Set;
  *
  * @author Kohsuke Kawaguchi
  */
-public class ArgumentListBuilder implements Serializable {
+public class ArgumentListBuilder implements Serializable, Cloneable {
     private final List<String> args = new ArrayList<String>();
     /**
      * Bit mask indicating arguments that shouldn't be echoed-back (e.g., password)
@@ -77,6 +78,12 @@ public class ArgumentListBuilder implements Serializable {
     }
 
     /**
+     * Optionally hide this part of the command line from being printed to the log.
+     * @param a a command argument
+     * @param mask true to suppress in output, false to print normally
+     * @return this
+     * @see hudson.Launcher.ProcStarter#masks(boolean[])
+     * @see Launcher#maskedPrintCommandLine(List, boolean[], FilePath)
      * @since 1.378
      */
     public ArgumentListBuilder add(String a, boolean mask) {
@@ -362,6 +369,26 @@ public class ArgumentListBuilder implements Serializable {
      */
     public void addMasked(String string) {
         add(string, true);
+    }
+
+    /**
+     * Debug/error message friendly output.
+     */
+    public String toString() {
+        StringBuilder buf = new StringBuilder();
+        for (int i=0; i<args.size(); i++) {
+            String arg = args.get(i);
+            if (mask.get(i))
+                arg = "******";
+
+            if(buf.length()>0)  buf.append(' ');
+
+            if(arg.indexOf(' ')>=0 || arg.length()==0)
+                buf.append('"').append(arg).append('"');
+            else
+                buf.append(arg);
+        }
+        return buf.toString();
     }
 
     private static final long serialVersionUID = 1L;

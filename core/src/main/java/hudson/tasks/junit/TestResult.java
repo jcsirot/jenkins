@@ -48,7 +48,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.logging.Logger;
 
 /**
  * Root of all the test results for one build.
@@ -56,7 +55,6 @@ import java.util.logging.Logger;
  * @author Kohsuke Kawaguchi
  */
 public final class TestResult extends MetaTabulatedResult {
-    private static final Logger LOGGER = Logger.getLogger(TestResult.class.getName());
 
     /**
      * List of all {@link SuiteResult}s in this test.
@@ -139,10 +137,20 @@ public final class TestResult extends MetaTabulatedResult {
     public void parse(long buildTime, DirectoryScanner results) throws IOException {
         String[] includedFiles = results.getIncludedFiles();
         File baseDir = results.getBasedir();
+        parse(buildTime,baseDir,includedFiles);
+    }
+        
+    /**
+     * Collect reports from the given report files, while
+     * filtering out all files that were created before the given time.
+     * 
+     * @since 1.426
+     */
+    public void parse(long buildTime, File baseDir, String[] reportFiles) throws IOException {
 
         boolean parsed=false;
 
-        for (String value : includedFiles) {
+        for (String value : reportFiles) {
             File reportFile = new File(baseDir, value);
             // only count files that were actually updated during this build
             if ( (buildTime-3000/*error margin*/ <= reportFile.lastModified()) || !checkTimestamps) {
@@ -167,7 +175,7 @@ public final class TestResult extends MetaTabulatedResult {
                     "I can't figure out what test results are new and what are old.\n" +
                     "Please keep the slave clock in sync with the master.");
 
-            File f = new File(baseDir,includedFiles[0]);
+            File f = new File(baseDir,reportFiles[0]);
             throw new AbortException(
                 String.format(
                 "Test reports were found but none of them are new. Did tests run? %n"+
@@ -178,18 +186,37 @@ public final class TestResult extends MetaTabulatedResult {
 
     private void add(SuiteResult sr) {
         for (SuiteResult s : suites) {
-            // a common problem is that people parse TEST-*.xml as well as TESTS-TestSuite.xml
-            // see http://www.nabble.com/Problem-with-duplicate-build-execution-td17549182.html for discussion
-            if(s.getName().equals(sr.getName()) && eq(s.getTimestamp(),sr.getTimestamp()) 
-                    && eq(s.getId(),sr.getId()))
-                return; // duplicate
+            // JENKINS-12457: If a testsuite is distributed over multiple files, merge it into a single SuiteResult:
+            if(s.getName().equals(sr.getName())  && nullSafeEq(s.getId(),sr.getId())) {
+            
+                // However, a common problem is that people parse TEST-*.xml as well as TESTS-TestSuite.xml.
+                // In that case consider the result file as a duplicate and discard it.
+                // see http://jenkins.361315.n4.nabble.com/Problem-with-duplicate-build-execution-td371616.html for discussion.
+                if(strictEq(s.getTimestamp(),sr.getTimestamp())) {
+                    return;
+                }
+            
+                for (CaseResult cr: sr.getCases()) {
+                    s.addCase(cr);
+                    cr.replaceParent(s);
+                }
+                duration += sr.getDuration();
+                return;
+            }
         }
         suites.add(sr);
         duration += sr.getDuration();
     }
-
-    private boolean eq(Object lhs, Object rhs) {
+    
+    private boolean strictEq(Object lhs, Object rhs) {
         return lhs != null && rhs != null && lhs.equals(rhs);
+    }
+
+    private boolean nullSafeEq(Object lhs, Object rhs) {
+        if (lhs == null) {
+            return rhs == null;
+        }
+        return lhs.equals(rhs);
     }
 
     /**
@@ -199,6 +226,8 @@ public final class TestResult extends MetaTabulatedResult {
         try {
             for (SuiteResult suiteResult : SuiteResult.parse(reportFile, keepLongStdio))
                 add(suiteResult);
+        } catch (InterruptedException e) {
+            throw new IOException2("Failed to read "+reportFile,e);
         } catch (RuntimeException e) {
             throw new IOException2("Failed to read "+reportFile,e);
         } catch (DocumentException e) {

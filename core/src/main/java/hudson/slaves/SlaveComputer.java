@@ -24,7 +24,9 @@
 package hudson.slaves;
 
 import hudson.model.*;
-import hudson.model.Hudson.MasterComputer;
+import hudson.util.IOUtils;
+import hudson.util.io.ReopenableRotatingFileOutputStream;
+import jenkins.model.Jenkins.MasterComputer;
 import hudson.remoting.Channel;
 import hudson.remoting.VirtualChannel;
 import hudson.remoting.Callable;
@@ -57,6 +59,7 @@ import java.util.concurrent.Future;
 import java.security.Security;
 
 import hudson.util.io.ReopenableFileOutputStream;
+import jenkins.model.Jenkins;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerResponse;
 import org.kohsuke.stapler.QueryParameter;
@@ -114,7 +117,7 @@ public class SlaveComputer extends Computer {
 
     public SlaveComputer(Slave slave) {
         super(slave);
-        this.log = new ReopenableFileOutputStream(getLogFile());
+        this.log = new ReopenableRotatingFileOutputStream(getLogFile(),10);
         this.taskListener = new StreamTaskListener(log);
     }
 
@@ -195,7 +198,6 @@ public class SlaveComputer extends Computer {
                             cl.preLaunch(SlaveComputer.this, taskListener);
 
                         launcher.launch(SlaveComputer.this, taskListener);
-                        return null;
                     } catch (AbortException e) {
                         taskListener.error(e.getMessage());
                         throw e;
@@ -214,6 +216,10 @@ public class SlaveComputer extends Computer {
                             cl.onLaunchFailure(SlaveComputer.this, taskListener);
                     }
                 }
+
+                if (channel==null)
+                    throw new IOException("Slave failed to connect, even though the launcher didn't report it. See the log output for details.");
+                return null;
             }
         });
     }
@@ -227,8 +233,11 @@ public class SlaveComputer extends Computer {
         if (launcher instanceof ExecutorListener) {
             ((ExecutorListener)launcher).taskAccepted(executor, task);
         }
-        if (getNode().getRetentionStrategy() instanceof ExecutorListener) {
-            ((ExecutorListener)getNode().getRetentionStrategy()).taskAccepted(executor, task);
+        
+        //getNode() can return null at indeterminate times when nodes go offline
+        Slave node = getNode();
+        if (node != null && node.getRetentionStrategy() instanceof ExecutorListener) {
+            ((ExecutorListener)node.getRetentionStrategy()).taskAccepted(executor, task);
         }
     }
 
@@ -304,25 +313,33 @@ public class SlaveComputer extends Computer {
      *      so the implementation of the listener doesn't need to do that again.
      */
     public void setChannel(InputStream in, OutputStream out, OutputStream launchLog, Channel.Listener listener) throws IOException, InterruptedException {
+        Channel channel = new Channel(nodeName,threadPoolForRemoting, Channel.Mode.NEGOTIATE, in,out, launchLog);
+        setChannel(channel,launchLog,listener);
+    }
+
+    /**
+     * Sets up the connection through an exsting channel.
+     *
+     * @since 1.444
+     */
+    public void setChannel(Channel channel, OutputStream launchLog, Channel.Listener listener) throws IOException, InterruptedException {
         if(this.channel!=null)
             throw new IllegalStateException("Already connected");
 
         final TaskListener taskListener = new StreamTaskListener(launchLog);
         PrintStream log = taskListener.getLogger();
 
-        Channel channel = new Channel(nodeName,threadPoolForRemoting, Channel.Mode.NEGOTIATE,
-            in,out, launchLog);
         channel.addListener(new Channel.Listener() {
             @Override
             public void onClosed(Channel c, IOException cause) {
-                SlaveComputer.this.channel = null;
                 // Orderly shutdown will have null exception
                 if (cause!=null) {
                     offlineCause = new ChannelTermination(cause);
-                     cause.printStackTrace(taskListener.error("Connection terminated"));
+                    cause.printStackTrace(taskListener.error("Connection terminated"));
                 } else {
                     taskListener.getLogger().println("Connection terminated");
                 }
+                closeChannel();
                 launcher.afterDisconnect(SlaveComputer.this, taskListener);
             }
         });
@@ -378,7 +395,7 @@ public class SlaveComputer extends Computer {
         for (ComputerListener cl : ComputerListener.all())
             cl.onOnline(this,taskListener);
         log.println("Slave successfully connected and online");
-        Hudson.getInstance().getQueue().scheduleMaintenance();
+        Jenkins.getInstance().getQueue().scheduleMaintenance();
     }
 
     @Override
@@ -404,10 +421,10 @@ public class SlaveComputer extends Computer {
     public HttpResponse doDoDisconnect(@QueryParameter String offlineMessage) throws IOException, ServletException {
         if (channel!=null) {
             //does nothing in case computer is already disconnected
-            checkPermission(Hudson.ADMINISTER);
+            checkPermission(DISCONNECT);
             offlineMessage = Util.fixEmptyAndTrim(offlineMessage);
             disconnect(OfflineCause.create(Messages._SlaveComputer_DisconnectedBy(
-                    Hudson.getAuthentication().getName(),
+                    Jenkins.getAuthentication().getName(),
                     offlineMessage!=null ? " : " + offlineMessage : "")
             ));
         }
@@ -430,7 +447,7 @@ public class SlaveComputer extends Computer {
 
     public void doLaunchSlaveAgent(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
         if(channel!=null) {
-            rsp.sendError(HttpServletResponse.SC_NOT_FOUND);
+            req.getView(this,"already-launched.jelly").forward(req, rsp);
             return;
         }
 
@@ -454,7 +471,7 @@ public class SlaveComputer extends Computer {
      * Serves jar files for JNLP slave agents.
      *
      * @deprecated since 2008-08-18.
-     *      This URL binding is no longer used and moved up directly under to {@link Hudson},
+     *      This URL binding is no longer used and moved up directly under to {@link jenkins.model.Jenkins},
      *      but it's left here for now just in case some old JNLP slave agents request it.
      */
     public Slave.JnlpJar getJnlpJars(String fileName) {
@@ -465,6 +482,7 @@ public class SlaveComputer extends Computer {
     protected void kill() {
         super.kill();
         closeChannel();
+        IOUtils.closeQuietly(log);
     }
 
     public RetentionStrategy getRetentionStrategy() {
@@ -486,9 +504,9 @@ public class SlaveComputer extends Computer {
             } catch (IOException e) {
                 logger.log(Level.SEVERE, "Failed to terminate channel to " + getDisplayName(), e);
             }
+            for (ComputerListener cl : ComputerListener.all())
+                cl.onOffline(this);
         }
-        for (ComputerListener cl : ComputerListener.all())
-            cl.onOffline(this);
     }
 
     @Override
@@ -573,12 +591,11 @@ public class SlaveComputer extends Computer {
             // avoid double installation of the handler. JNLP slaves can reconnect to the master multiple times
             // and each connection gets a different RemoteClassLoader, so we need to evict them by class name,
             // not by their identity.
-            Logger logger = Logger.getLogger("hudson");
-            for (Handler h : logger.getHandlers()) {
+            for (Handler h : LOGGER.getHandlers()) {
                 if (h.getClass().getName().equals(SLAVE_LOG_HANDLER.getClass().getName()))
-                    logger.removeHandler(h);
+                    LOGGER.removeHandler(h);
             }
-            logger.addHandler(SLAVE_LOG_HANDLER);
+            LOGGER.addHandler(SLAVE_LOG_HANDLER);
 
             // remove Sun PKCS11 provider if present. See http://wiki.jenkins-ci.org/display/JENKINS/Solaris+Issue+6276483
             try {
@@ -592,6 +609,7 @@ public class SlaveComputer extends Computer {
             return null;
         }
         private static final long serialVersionUID = 1L;
+        private static final Logger LOGGER = Logger.getLogger("hudson");
     }
 
     /**
@@ -604,7 +622,7 @@ public class SlaveComputer extends Computer {
      * @since 1.362
      */
     public static VirtualChannel getChannelToMaster() {
-        if (Hudson.getInstance()!=null)
+        if (Jenkins.getInstance()!=null)
             return MasterComputer.localChannel;
 
         // if this method is called from within the slave computation thread, this should work

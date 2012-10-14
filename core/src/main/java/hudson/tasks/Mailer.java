@@ -24,21 +24,23 @@
  */
 package hudson.tasks;
 
+import static hudson.Util.fixEmptyAndTrim;
+
 import hudson.EnvVars;
 import hudson.Extension;
 import hudson.Functions;
 import hudson.Launcher;
 import hudson.RestrictedSince;
 import hudson.Util;
-import static hudson.Util.fixEmptyAndTrim;
 import hudson.model.AbstractBuild;
 import hudson.model.AbstractProject;
 import hudson.model.BuildListener;
 import hudson.model.User;
 import hudson.model.UserPropertyDescriptor;
-import hudson.model.Hudson;
 import hudson.util.FormValidation;
 import hudson.util.Secret;
+
+import org.apache.commons.lang.StringUtils;
 import org.apache.tools.ant.types.selectors.SelectorUtils;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
@@ -46,6 +48,18 @@ import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.export.Exported;
 
+import java.io.File;
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.Date;
+import java.util.Properties;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.regex.Pattern;
+import java.util.regex.Matcher;
+import javax.mail.Address;
 import javax.mail.Authenticator;
 import javax.mail.Message;
 import javax.mail.MessagingException;
@@ -56,15 +70,15 @@ import javax.mail.internet.AddressException;
 import javax.mail.internet.InternetAddress;
 import javax.mail.internet.MimeMessage;
 import javax.servlet.ServletException;
-import java.io.File;
-import java.io.IOException;
-import java.util.Date;
-import java.util.Properties;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
 
+import org.apache.tools.ant.types.selectors.SelectorUtils;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.export.Exported;
+
+import jenkins.model.Jenkins;
 import net.sf.json.JSONObject;
 
 /**
@@ -131,6 +145,18 @@ public class Mailer extends Notifier {
         return BuildStepMonitor.NONE;
     }
 
+    private static Pattern ADDRESS_PATTERN = Pattern.compile("\\s*([^<]*)<([^>]+)>\\s*");
+    public static InternetAddress StringToAddress(String strAddress, String charset) throws AddressException, UnsupportedEncodingException {
+        Matcher m = ADDRESS_PATTERN.matcher(strAddress);
+        if(!m.matches()) {
+            return new InternetAddress(strAddress);
+        }
+
+        String personal = m.group(1);
+        String address = m.group(2);
+        return new InternetAddress(address, personal, charset);
+    }
+
     /**
      * @deprecated as of 1.286
      *      Use {@link #descriptor()} to obtain the current instance.
@@ -140,7 +166,7 @@ public class Mailer extends Notifier {
     public static DescriptorImpl DESCRIPTOR;
 
     public static DescriptorImpl descriptor() {
-        return Hudson.getInstance().getDescriptorByType(Mailer.DescriptorImpl.class);
+        return Jenkins.getInstance().getDescriptorByType(Mailer.DescriptorImpl.class);
     }
 
     @Extension
@@ -168,6 +194,12 @@ public class Mailer extends Notifier {
          * Null if not configured.
          */
         private String adminAddress;
+
+        /**
+         * The e-mail address that Jenkins puts to "Reply-To" header in outgoing e-mails.
+         * Null if not configured.
+         */
+        private String replyToAddress;
 
         /**
          * The SMTP server to use for sending e-mail. Null for default to the environment,
@@ -213,6 +245,14 @@ public class Mailer extends Notifier {
 
         public String getDefaultSuffix() {
             return defaultSuffix;
+        }
+
+        public String getReplyToAddress() {
+            return replyToAddress;
+        }
+
+        public void setReplyToAddress(String address) {
+            this.replyToAddress = Util.fixEmpty(address);
         }
 
         /** JavaMail session. */
@@ -271,6 +311,7 @@ public class Mailer extends Notifier {
             // this code is brain dead
             smtpHost = nullify(json.getString("smtpServer"));
             setAdminAddress(json.getString("adminAddress"));
+            setReplyToAddress(json.getString("replyToAddress"));
 
             defaultSuffix = nullify(json.getString("defaultSuffix"));
             String url = nullify(json.getString("url"));
@@ -439,16 +480,20 @@ public class Mailer extends Notifier {
         public FormValidation doSendTestMail(
                 @QueryParameter String smtpServer, @QueryParameter String adminAddress, @QueryParameter boolean useSMTPAuth,
                 @QueryParameter String smtpAuthUserName, @QueryParameter String smtpAuthPassword,
-                @QueryParameter boolean useSsl, @QueryParameter String smtpPort) throws IOException, ServletException, InterruptedException {
+                @QueryParameter boolean useSsl, @QueryParameter String smtpPort, @QueryParameter String charset,
+                @QueryParameter String sendTestMailTo) throws IOException, ServletException, InterruptedException {
             try {
                 if (!useSMTPAuth)   smtpAuthUserName = smtpAuthPassword = null;
                 
                 MimeMessage msg = new MimeMessage(createSession(smtpServer,smtpPort,useSsl,smtpAuthUserName,Secret.fromString(smtpAuthPassword)));
-                msg.setSubject("Test email #" + ++testEmailCount);
-                msg.setContent("This is test email #" + testEmailCount + " sent from " + Hudson.getInstance().getDisplayName(), "text/plain");
-                msg.setFrom(new InternetAddress(adminAddress));
+                msg.setSubject(Messages.Mailer_TestMail_Subject(++testEmailCount), charset);
+                msg.setText(Messages.Mailer_TestMail_Content(testEmailCount, Jenkins.getInstance().getDisplayName()), charset);
+                msg.setFrom(StringToAddress(adminAddress, charset));
+                if (StringUtils.isNotBlank(replyToAddress)) {
+                    msg.setReplyTo(new Address[]{StringToAddress(replyToAddress, charset)});
+                }
                 msg.setSentDate(new Date());
-                msg.setRecipient(Message.RecipientType.TO, new InternetAddress(adminAddress));
+                msg.setRecipient(Message.RecipientType.TO, StringToAddress(sendTestMailTo, charset));
 
                 Transport.send(msg);                
                 return FormValidation.ok(Messages.Mailer_EmailSentSuccessfully());
@@ -478,11 +523,18 @@ public class Mailer extends Notifier {
 
         @Exported
         public String getAddress() {
-            if(emailAddress!=null)
+            if(hasExplicitlyConfiguredAddress())
                 return emailAddress;
 
             // try the inference logic
             return MailAddressResolver.resolve(user);
+        }
+
+        /**
+         * Has the user configured a value explicitly (true), or is it inferred (false)?
+         */
+        public boolean hasExplicitlyConfiguredAddress() {
+            return Util.fixEmptyAndTrim(emailAddress)!=null;
         }
 
         @Extension

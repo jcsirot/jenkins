@@ -23,7 +23,13 @@
  */
 package hudson.model;
 
+import hudson.views.ListViewColumn;
+import hudson.views.ListViewColumnDescriptor;
+import hudson.views.ViewJobFilter;
+import jenkins.model.Jenkins;
 import org.kohsuke.stapler.QueryParameter;
+
+import java.util.List;
 
 /**
  * {@link Descriptor} for {@link View}.
@@ -83,8 +89,22 @@ public abstract class ViewDescriptor extends Descriptor<View> {
                     super.onItem(i);
                 }
             }
-        }.onItemGroup(Hudson.getInstance());
+        }.onItemGroup(Jenkins.getInstance());
 
         return r;
+    }
+
+    /**
+     * Possible {@link ListViewColumnDescriptor}s that can be used with this view.
+     */
+    public List<Descriptor<ListViewColumn>> getColumnsDescriptors() {
+        return ListViewColumn.all();
+    }
+
+    /**
+     * Possible {@link ViewJobFilter} types that can be used with this view.
+     */
+    public List<Descriptor<ViewJobFilter>> getJobFiltersDescriptors() {
+        return ViewJobFilter.all();
     }
 }

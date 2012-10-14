@@ -23,16 +23,20 @@
  */
 package hudson.tasks.junit;
 
+import edu.umd.cs.findbugs.annotations.SuppressWarnings;
 import java.io.File;
 import java.util.List;
 import java.net.URISyntaxException;
 
-import junit.framework.TestCase;
-
 import hudson.XmlFile;
+
+import org.jvnet.hudson.test.Bug;
+
 import java.io.FileWriter;
 import java.io.PrintWriter;
 import java.io.Writer;
+
+import junit.framework.TestCase;
 
 /**
  * Test cases for parsing JUnit report XML files.
@@ -40,6 +44,7 @@ import java.io.Writer;
  * varied xml files.
  * 
  * @author Erik Ramfelt
+ * @author Christoph Kutzinski
  */
 public class SuiteResultTest extends TestCase {
 
@@ -51,6 +56,10 @@ public class SuiteResultTest extends TestCase {
         List<SuiteResult> results = SuiteResult.parse(file, false);
         assertEquals(1,results.size());
         return results.get(0);
+    }
+    
+    private List<SuiteResult> parseSuites(File file) throws Exception {
+        return SuiteResult.parse(file, false);
     }
 
     /**
@@ -177,4 +186,70 @@ public class SuiteResultTest extends TestCase {
         }
     }
 
+    @SuppressWarnings({"RV_RETURN_VALUE_IGNORED_BAD_PRACTICE", "DM_DEFAULT_ENCODING", "OS_OPEN_STREAM"})
+    public void testSuiteStdioTrimmingSurefire() throws Exception {
+        File data = File.createTempFile("TEST-", ".xml");
+        try {
+            Writer w = new FileWriter(data);
+            try {
+                PrintWriter pw = new PrintWriter(w);
+                pw.println("<testsuites name='x'>");
+                pw.println("<testsuite failures='0' errors='0' tests='1' name='x'>");
+                pw.println("<testcase name='x' classname='x'/>");
+                pw.println("</testsuite>");
+                pw.println("</testsuites>");
+                pw.flush();
+            } finally {
+                w.close();
+            }
+            File data2 = new File(data.getParentFile(), data.getName().replaceFirst("^TEST-(.+)[.]xml$", "$1-output.txt"));
+            try {
+                w = new FileWriter(data2);
+                try {
+                    PrintWriter pw = new PrintWriter(w);
+                    pw.println("First line is intact.");
+                    for (int i = 0; i < 100; i++) {
+                        pw.println("Line #" + i + " might be elided.");
+                    }
+                    pw.println("Last line is intact.");
+                    pw.flush();
+                } finally {
+                    w.close();
+                }
+                SuiteResult sr = parseOne(data);
+                assertEquals(sr.getStdout(), 1028, sr.getStdout().length());
+            } finally {
+                data2.delete();
+            }
+        } finally {
+            data.delete();
+        }
+    }
+
+    /**
+     * When the testcase fails to initialize (exception in constructor or @Before)
+     * there is no 'testcase' element at all.
+     */
+    @Bug(6700)
+    public void testErrorInTestInitialization() throws Exception {
+        SuiteResult suiteResult = parseOne(getDataFile("junit-report-6700.xml"));
+        
+        assertEquals(1, suiteResult.getCases().size());
+        
+        CaseResult result = suiteResult.getCases().get(0);
+        assertEquals(1, result.getFailCount());
+        assertTrue(result.getErrorStackTrace() != null);
+    }
+    
+    @Bug(6454)
+    public void testParseNestedTestSuites() throws Exception {
+        // A report with several nested suites
+        // 3 of them have actual some tests - each exactly one
+        List<SuiteResult> results = parseSuites(getDataFile("junit-report-nested-testsuites.xml"));
+        assertEquals(3, results.size());
+        
+        for (SuiteResult result : results) {
+            assertEquals(1, result.getCases().size());
+        }
+    }
 }

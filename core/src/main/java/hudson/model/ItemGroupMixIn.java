@@ -29,6 +29,7 @@ import hudson.security.AccessControlled;
 import hudson.util.CopyOnWriteMap;
 import hudson.util.Function1;
 import hudson.util.IOUtils;
+import jenkins.model.Jenkins;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerResponse;
 
@@ -45,6 +46,7 @@ import java.util.Map;
  * implementations. Not meant for a consumption from outside {@link ItemGroup}s.
  *
  * @author Kohsuke Kawaguchi
+ * @see ViewGroupMixIn
  */
 public abstract class ItemGroupMixIn {
     /**
@@ -133,7 +135,7 @@ public abstract class ItemGroupMixIn {
             throw new Failure("Query parameter 'name' is required");
 
         {// check if the name looks good
-            Hudson.checkGoodName(name);
+            Jenkins.checkGoodName(name);
             name = name.trim();
             if(parent.getItem(name)!=null)
                 throw new Failure(Messages.Hudson_JobAlreadyExists(name));
@@ -148,7 +150,7 @@ public abstract class ItemGroupMixIn {
             if (!from.startsWith("/"))
                 src = parent.getItem(from);
             if (src==null)
-                src = Hudson.getInstance().getItemByFullName(from);
+                src = Jenkins.getInstance().getItemByFullName(from);
 
             if(src==null) {
                 if(Util.fixEmpty(from)==null)
@@ -170,7 +172,7 @@ public abstract class ItemGroupMixIn {
                     throw new Failure("No mode given");
 
                 // create empty job and redirect to the project config screen
-                result = createProject(Items.getDescriptor(mode), name, true);
+                result = createProject(Items.all().findByName(mode), name, true);
             }
         }
 
@@ -201,11 +203,17 @@ public abstract class ItemGroupMixIn {
         Util.copyFile(Items.getConfigFile(src).getFile(),Items.getConfigFile(result).getFile());
 
         // reload from the new config
-        result = (T)Items.load(parent,result.getRootDir());
+        Items.updatingByXml.set(true);
+        try {
+            result = (T)Items.load(parent,result.getRootDir());
+        } finally {
+            Items.updatingByXml.set(false);
+        }
         result.onCopiedFrom(src);
 
         add(result);
         ItemListener.fireOnCopied(src,result);
+        Hudson.getInstance().rebuildDependencyGraph();
 
         return result;
     }
@@ -213,6 +221,7 @@ public abstract class ItemGroupMixIn {
     public synchronized TopLevelItem createProjectFromXML(String name, InputStream xml) throws IOException {
         acl.checkPermission(Job.CREATE);
 
+        Jenkins.getInstance().getProjectNamingStrategy().checkName(name);
         // place it as config.xml
         File configXml = Items.getConfigFile(getRootDirFor(name)).getFile();
         configXml.getParentFile().mkdirs();
@@ -220,11 +229,17 @@ public abstract class ItemGroupMixIn {
             IOUtils.copy(xml,configXml);
 
             // load it
-            TopLevelItem result = (TopLevelItem)Items.load(parent,configXml.getParentFile());
+            TopLevelItem result;
+            Items.updatingByXml.set(true);
+            try {
+                result = (TopLevelItem)Items.load(parent,configXml.getParentFile());
+            } finally {
+                Items.updatingByXml.set(false);
+            }
             add(result);
 
             ItemListener.fireOnCreated(result);
-            Hudson.getInstance().rebuildDependencyGraph();
+            Jenkins.getInstance().rebuildDependencyGraph();
 
             return result;
         } catch (IOException e) {
@@ -238,6 +253,7 @@ public abstract class ItemGroupMixIn {
             throws IOException {
         acl.checkPermission(Job.CREATE);
 
+        Jenkins.getInstance().getProjectNamingStrategy().checkName(name);
         if(parent.getItem(name)!=null)
             throw new IllegalArgumentException("Project of the name "+name+" already exists");
 

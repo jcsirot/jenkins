@@ -24,13 +24,20 @@
  */
 package hudson.maven;
 
-import static hudson.Util.fixEmpty;
+import static hudson.Util.*;
 import static hudson.model.ItemGroupMixIn.loadChildren;
 import hudson.CopyOnWrite;
+import hudson.EnvVars;
 import hudson.Extension;
 import hudson.FilePath;
+import hudson.Functions;
 import hudson.Indenter;
 import hudson.Util;
+import hudson.maven.local_repo.DefaultLocalRepositoryLocator;
+import hudson.maven.local_repo.LocalRepositoryLocator;
+import hudson.maven.local_repo.PerJobLocalRepositoryLocator;
+import hudson.maven.settings.SettingConfig;
+import hudson.maven.settings.SettingsProviderUtils;
 import hudson.model.AbstractProject;
 import hudson.model.Action;
 import hudson.model.BuildableItemWithBuildWrappers;
@@ -38,28 +45,29 @@ import hudson.model.DependencyGraph;
 import hudson.model.Descriptor;
 import hudson.model.Descriptor.FormException;
 import hudson.model.Executor;
-import hudson.model.Hudson;
 import hudson.model.Item;
 import hudson.model.ItemGroup;
 import hudson.model.Job;
 import hudson.model.Queue;
 import hudson.model.Queue.Task;
 import hudson.model.ResourceActivity;
+import hudson.model.Result;
 import hudson.model.SCMedItem;
 import hudson.model.Saveable;
+import hudson.model.TaskListener;
 import hudson.model.TopLevelItem;
 import hudson.search.CollectionSearchIndex;
 import hudson.search.SearchIndexBuilder;
 import hudson.tasks.BuildStep;
-import hudson.tasks.BuildStepDescriptor;
 import hudson.tasks.BuildWrapper;
 import hudson.tasks.BuildWrappers;
+import hudson.tasks.Builder;
 import hudson.tasks.Fingerprinter;
-import hudson.tasks.JavadocArchiver;
 import hudson.tasks.Mailer;
 import hudson.tasks.Maven;
 import hudson.tasks.Maven.MavenInstallation;
 import hudson.tasks.Publisher;
+import hudson.tasks.JavadocArchiver;
 import hudson.tasks.junit.JUnitResultArchiver;
 import hudson.util.CopyOnWriteMap;
 import hudson.util.DescribableList;
@@ -82,10 +90,13 @@ import java.util.Stack;
 
 import javax.servlet.ServletException;
 
+import jenkins.model.Jenkins;
 import net.sf.json.JSONObject;
 
 import org.apache.commons.lang.math.NumberUtils;
 import org.apache.maven.model.building.ModelBuildingRequest;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerResponse;
@@ -101,7 +112,8 @@ import org.kohsuke.stapler.export.Exported;
  *
  * @author Kohsuke Kawaguchi
  */
-public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,MavenModuleSetBuild> implements TopLevelItem, ItemGroup<MavenModule>, SCMedItem, Saveable, BuildableItemWithBuildWrappers {
+public class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,MavenModuleSetBuild> implements TopLevelItem, ItemGroup<MavenModule>, SCMedItem, Saveable, BuildableItemWithBuildWrappers {
+	
     /**
      * All {@link MavenModule}s, keyed by their {@link MavenModule#getModuleName()} module name}s.
      */
@@ -170,8 +182,28 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
      * from multiple Maven process, so this helps there too.
      *
      * @since 1.223
+     * @deprecated as of 1.448
+     *      Subsumed by {@link #localRepository}. false maps to {@link DefaultLocalRepositoryLocator},
+     *      and true maps to {@link PerJobLocalRepositoryLocator}
      */
-    private boolean usePrivateRepository = false;
+    private transient Boolean usePrivateRepository;
+
+    /**
+     * Encapsulates where to run the local repository.
+     *
+     * If null, inherited from the global configuration.
+     * 
+     * @since 1.448
+     */
+    private LocalRepositoryLocator localRepository = null;
+    
+   /**
+    * If true, the build will send a failure e-mail for each failing maven module.
+    * Defaults to <code>true</code> to simulate old behavior. 
+    * <p>
+    * see JENKINS-5695. 
+    */
+    private Boolean perModuleEmail = Boolean.TRUE;
 
     /**
      * If true, do not automatically schedule a build when one of the project dependencies is built.
@@ -211,6 +243,21 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
     private boolean runHeadless = false;
 
     /**
+     * @since 1.426
+     */
+    private String settingConfigId;
+
+    /**
+     * @since 1.426
+     */
+    private String globalSettingConfigId;
+
+    /**
+     * used temporary during maven build to store file path
+     * @since 1.426
+     */
+    protected transient String globalSettingConfigPath;
+    /**
      * Reporters configured at {@link MavenModuleSet} level. Applies to all {@link MavenModule} builds.
      */
     private DescribableList<MavenReporter,Descriptor<MavenReporter>> reporters =
@@ -230,12 +277,61 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
     private DescribableList<BuildWrapper,Descriptor<BuildWrapper>> buildWrappers =
         new DescribableList<BuildWrapper, Descriptor<BuildWrapper>>(this);
 
+	/**
+     * List of active {@link Builder}s configured for this project.
+     */
+    private DescribableList<Builder,Descriptor<Builder>> prebuilders =
+            new DescribableList<Builder,Descriptor<Builder>>(this);
+    
+    private DescribableList<Builder,Descriptor<Builder>> postbuilders =
+            new DescribableList<Builder,Descriptor<Builder>>(this);
+	
+    private Result runPostStepsIfResult;
+    
+   
+    /**
+     * @deprecated
+     *      Use {@link #MavenModuleSet(ItemGroup, String)}
+     */
     public MavenModuleSet(String name) {
-        this(Hudson.getInstance(),name);
+        this(Jenkins.getInstance(),name);
     }
 
     public MavenModuleSet(ItemGroup parent, String name) {
-        super(Hudson.getInstance(),name);
+        super(parent,name);
+    }
+
+    /**
+     * Builders that are run before the main Maven execution.
+     *
+     * @since 1.433
+     */
+	public DescribableList<Builder,Descriptor<Builder>> getPrebuilders() {
+        return prebuilders;
+    }
+	
+    /**
+     * Builders that are run after the main Maven execution.
+     *
+     * @since 1.433
+     */
+	public DescribableList<Builder,Descriptor<Builder>> getPostbuilders() {
+        return postbuilders;
+    }
+	
+	/**
+     * {@link #postbuilders} are run if the result is better or equal to this threshold.
+     *
+     * @return
+     *      never null
+     * @since 1.433
+	 */
+	public Result getRunPostStepsIfResult() {
+		return Functions.defaulted(runPostStepsIfResult,Result.FAILURE);
+	}
+
+    public void setRunPostStepsIfResult(Result v) {
+        this.runPostStepsIfResult = Functions.defaulted(v,Result.FAILURE);
     }
 
     public String getUrlChildPrefix() {
@@ -355,10 +451,18 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
         return aggregatorStyleBuild;
     }
 
+    /**
+     * @deprecated as of 1.448
+     *      Use {@link #getLocalRepository()}
+     */
     public boolean usesPrivateRepository() {
-        return usePrivateRepository;
+        return !(getLocalRepository() instanceof DefaultLocalRepositoryLocator);
     }
 
+    public boolean isPerModuleEmail() {
+        return perModuleEmail;
+    }
+    
     public boolean ignoreUpstremChanges() {
         return ignoreUpstremChanges;
     }
@@ -379,8 +483,31 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
         this.aggregatorStyleBuild = aggregatorStyleBuild;
     }
 
+    /**
+     * @deprecated as of 1.448.
+     *      Use {@link #setLocalRepository(LocalRepositoryLocator)} instead
+     */
     public void setUsePrivateRepository(boolean usePrivateRepository) {
-        this.usePrivateRepository = usePrivateRepository;
+        setLocalRepository(usePrivateRepository?new PerJobLocalRepositoryLocator() : new DefaultLocalRepositoryLocator());
+    }
+
+    /**
+     * @return 
+     *      never null
+     */
+    public LocalRepositoryLocator getLocalRepository() {
+        return localRepository!=null ? localRepository : getDescriptor().getLocalRepository();
+    }
+
+    /**
+     * Undefaulted locally configured value with taking inheritance from the global configuration into account.
+     */
+    public LocalRepositoryLocator getExplicitLocalRepository() {
+        return localRepository;
+    }
+
+    public void setLocalRepository(LocalRepositoryLocator localRepository) {
+        this.localRepository = localRepository;
     }
 
     public void setIgnoreUpstremChanges(boolean ignoreUpstremChanges) {
@@ -414,8 +541,40 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
 
     public int getMavenValidationLevel() {
         return mavenValidationLevel;
-    }    
-    
+    }
+
+    /**
+     * @since 1.426
+     * @return
+     */
+    public String getSettingConfigId() {
+        return settingConfigId;
+    }
+
+    /**
+     * @since 1.426
+     * @param settingConfigId
+     */
+    public void setSettingConfigId( String settingConfigId ) {
+        this.settingConfigId = settingConfigId;
+    }
+
+    /**
+     * @since 1.426
+     * @return
+     */
+    public String getGlobalSettingConfigId() {
+        return globalSettingConfigId;
+    }
+
+    /**
+     * @since 1.426
+     * @param globalSettingConfigId
+     */
+    public void setGlobalSettingConfigId( String globalSettingConfigId ) {
+        this.globalSettingConfigId = globalSettingConfigId;
+    }
+
     /**
      * List of active {@link MavenReporter}s that should be applied to all module builds.
      */
@@ -535,16 +694,36 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
             this.sortedActiveModules = getDisabledModules(false);
         }
 
-        if(reporters==null)
+        if(reporters==null){
             reporters = new DescribableList<MavenReporter, Descriptor<MavenReporter>>(this);
+        }
         reporters.setOwner(this);
-        if(publishers==null)
+        if(publishers==null){
             publishers = new DescribableList<Publisher,Descriptor<Publisher>>(this);
+        }
         publishers.setOwner(this);
-        if(buildWrappers==null)
+        if(buildWrappers==null){
             buildWrappers = new DescribableList<BuildWrapper, Descriptor<BuildWrapper>>(this);
+        }
         buildWrappers.setOwner(this);
-
+        if(prebuilders==null){
+        	prebuilders = new DescribableList<Builder,Descriptor<Builder>>(this);
+        }
+        prebuilders.setOwner(this);
+        if(postbuilders==null){
+        	postbuilders = new DescribableList<Builder,Descriptor<Builder>>(this);
+        }
+        postbuilders.setOwner(this);
+        
+        if(perModuleEmail == null){
+            perModuleEmail = Boolean.TRUE;
+        }
+        
+        if (Boolean.TRUE.equals(usePrivateRepository)) {
+            this.localRepository = new PerJobLocalRepositoryLocator();
+            usePrivateRepository = null;
+        }
+        
         updateTransientActions();
     }
 
@@ -600,6 +779,8 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
         
         publishers.buildDependencyGraph(this,graph);
         buildWrappers.buildDependencyGraph(this,graph);
+        prebuilders.buildDependencyGraph(this,graph);
+        postbuilders.buildDependencyGraph(this,graph);
     }
 
     public MavenModule getRootModule() {
@@ -616,18 +797,32 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
         final Set<ResourceActivity> activities = new HashSet<ResourceActivity>();
 
         activities.addAll(super.getResourceActivities());
-        activities.addAll(Util.filter(publishers,ResourceActivity.class));
-        activities.addAll(Util.filter(buildWrappers,ResourceActivity.class));
+        activities.addAll(Util.filter(publishers, ResourceActivity.class));
+        activities.addAll(Util.filter(buildWrappers, ResourceActivity.class));
+        activities.addAll(Util.filter(prebuilders, ResourceActivity.class));
+        activities.addAll(Util.filter(postbuilders, ResourceActivity.class));
 
         return activities;
     }
 
     /**
-     * Gets the location of top-level <tt>pom.xml</tt> relative to the workspace root.
+     *
+     * @deprecated for backward comp only
+     * @return
      */
-    public String getRootPOM() {
-        if(rootPOM==null)   return "pom.xml";
-        return rootPOM;
+    public String getRootPOM(){
+        return getRootPOM( null );
+    }
+
+    /**
+     * Gets the location of top-level <tt>pom.xml</tt> relative to the workspace root.
+     * @since 1.466
+     */
+    public String getRootPOM(EnvVars env) {
+        if (rootPOM == null) return "pom.xml";
+        // JENKINS-13822
+        if (env == null) return rootPOM;
+        return env.expand(rootPOM);
     }
 
     public void setRootPOM(String rootPOM) {
@@ -732,6 +927,11 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
      * to be used to launch Maven process.
      *
      * If mavenOpts is null or empty, we'll return the globally-defined MAVEN_OPTS.
+     *
+     * <p>
+     * This method returns a configured value as-is, which can include variabl references.
+     * At runtime, use {@link AbstractMavenBuild#getMavenOpts(TaskListener, EnvVars)} to obtain
+     * a fully resolved value.
      */
     public String getMavenOpts() {
         if ((mavenOpts!=null) && (mavenOpts.trim().length()>0)) { 
@@ -746,6 +946,22 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
                 return globalOpts;
             }
         }
+    }
+
+    /**
+     * @since 1.426
+     * @return
+     */
+    public List<SettingConfig> getAllMavenSettingsConfigs() {
+        return SettingsProviderUtils.getAllMavenSettingsConfigs();
+    }
+    
+    /**
+     * @since 1.426
+     * @return
+     */
+    public List<SettingConfig> getAllGlobalMavenSettingsConfigs() {
+        return SettingsProviderUtils.getAllGlobalMavenSettingsConfigs();
     }
 
     /**
@@ -775,8 +991,19 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
      * Returns the {@link MavenModule}s that are in the queue.
      */
     public List<Queue.Item> getQueueItems() {
-        List<Queue.Item> r = new ArrayList<hudson.model.Queue.Item>();
-        for( Queue.Item item : Hudson.getInstance().getQueue().getItems() ) {
+        return filter(Arrays.asList(Jenkins.getInstance().getQueue().getItems()));
+    }
+
+    /**
+     * Returns the {@link MavenModule}s that are in the queue.
+     */
+    public List<Queue.Item> getApproximateQueueItemsQuickly() {
+        return filter(Jenkins.getInstance().getQueue().getApproximateItemsQuickly());
+    }
+
+    private List<Queue.Item> filter(Collection<Queue.Item> base) {
+        List<Queue.Item> r = new ArrayList<Queue.Item>();
+        for( Queue.Item item : base) {
             Task t = item.task;
             if((t instanceof MavenModule && ((MavenModule)t).getParent()==this) || t ==this)
                 r.add(item);
@@ -823,7 +1050,11 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
         mavenOpts = Util.fixEmpty(req.getParameter("mavenOpts").trim());
         mavenName = req.getParameter("maven_version");
         aggregatorStyleBuild = !req.hasParameter("maven.perModuleBuild");
-        usePrivateRepository = req.hasParameter("maven.usePrivateRepository");
+        if (json.optBoolean("usePrivateRepository"))
+            localRepository = req.bindJSON(LocalRepositoryLocator.class,json.getJSONObject("explicitLocalRepository"));
+        else
+            localRepository = null;
+        perModuleEmail = req.hasParameter("maven.perModuleEmail");
         ignoreUpstremChanges = !json.has("triggerByDependency");
         runHeadless = req.hasParameter("maven.runHeadless");
         incrementalBuild = req.hasParameter("maven.incrementalBuild");
@@ -832,18 +1063,24 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
         processPlugins = req.hasParameter( "maven.processPlugins" );
         mavenValidationLevel = NumberUtils.toInt( req.getParameter( "maven.validationLevel" ), -1 );
         reporters.rebuild(req,json,MavenReporters.getConfigurableList());
-        publishers.rebuild(req,json,BuildStepDescriptor.filter(Publisher.all(),this.getClass()));
+        publishers.rebuildHetero(req, json, Publisher.all(), "publisher");
         buildWrappers.rebuild(req,json,BuildWrappers.getFor(this));
+        settingConfigId = req.getParameter( "maven.mavenSettingsConfigId" );
+        globalSettingConfigId = req.getParameter( "maven.mavenGlobalSettingConfigId" );
+
+        runPostStepsIfResult = Result.fromString(req.getParameter( "post-steps.runIfResult"));
+        prebuilders.rebuildHetero(req,json, Builder.all(), "prebuilder");
+        postbuilders.rebuildHetero(req,json, Builder.all(), "postbuilder");
     }
 
     /**
      * Delete all disabled modules.
      */
-    public void doDoDeleteAllDisabledModules(StaplerResponse rsp) throws IOException, InterruptedException {
+    public HttpResponse doDoDeleteAllDisabledModules() throws IOException, InterruptedException {
         checkPermission(DELETE);
         for( MavenModule m : getDisabledModules(true))
             m.delete();
-        rsp.sendRedirect2(".");
+        return HttpResponses.redirectToDot();
     }
     
     /**
@@ -899,6 +1136,11 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
          */
         private Map<String, Integer> mavenValidationLevels = new LinkedHashMap<String, Integer>();
 
+        /**
+         * @since 1.448
+         */
+        private LocalRepositoryLocator localRepository = new DefaultLocalRepositoryLocator();
+
         public DescriptorImpl() {
             super();
             load();
@@ -919,6 +1161,18 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
             save();
         }
 
+        /**
+         * @return never null.
+         */
+        public LocalRepositoryLocator getLocalRepository() {
+            return localRepository!=null ? localRepository : new DefaultLocalRepositoryLocator();
+        }
+
+        public void setLocalRepository(LocalRepositoryLocator localRepository) {
+            this.localRepository = localRepository;
+            save();
+        }
+
         public String getDisplayName() {
             return Messages.MavenModuleSet_DiplayName();
         }
@@ -928,7 +1182,7 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
         }
 
         public Maven.DescriptorImpl getMavenDescriptor() {
-            return Hudson.getInstance().getDescriptorByType(Maven.DescriptorImpl.class);
+            return Jenkins.getInstance().getDescriptorByType(Maven.DescriptorImpl.class);
         }
         
         /**
@@ -942,6 +1196,7 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
         @Override
         public boolean configure( StaplerRequest req, JSONObject o ) {
             globalMavenOpts = Util.fixEmptyAndTrim(o.getString("globalMavenOpts"));
+            localRepository = req.bindJSON(LocalRepositoryLocator.class,o.getJSONObject("localRepository"));
             save();
 
             return true;
@@ -958,13 +1213,5 @@ public final class MavenModuleSet extends AbstractMavenProject<MavenModuleSet,Ma
             Mailer.class,           // for historical reasons, Maven uses MavenMailer
             JUnitResultArchiver.class // done by SurefireArchiver
         ));
-
-
     }
-
-
-
-
-
-
 }

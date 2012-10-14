@@ -30,6 +30,10 @@ import hudson.model.*;
 import hudson.tasks.junit.History;
 import hudson.tasks.junit.TestAction;
 import hudson.tasks.junit.TestResultAction;
+import jenkins.model.Jenkins;
+
+import org.apache.commons.lang.StringEscapeUtils;
+import org.apache.commons.lang.StringUtils;
 import org.kohsuke.stapler.*;
 import org.kohsuke.stapler.export.ExportedBean;
 
@@ -37,6 +41,8 @@ import com.google.common.collect.MapMaker;
 
 import javax.servlet.ServletException;
 import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.*;
 import java.util.logging.Logger;
 
@@ -177,7 +183,7 @@ public abstract class TestObject extends hudson.tasks.junit.TestObject {
             } else {
                 // We're not in a stapler request. Okay, give up.
                 LOGGER.info("trying to get relative path, but it is not my ancestor, and we're not in a stapler request. Trying absolute hudson url...");
-                String hudsonRootUrl = Hudson.getInstance().getRootUrl();
+                String hudsonRootUrl = Jenkins.getInstance().getRootUrl();
                 if (hudsonRootUrl==null||hudsonRootUrl.length()==0) {
                     LOGGER.warning("Can't find anything like a decent hudson url. Punting, returning empty string."); 
                     return "";
@@ -347,8 +353,11 @@ public abstract class TestObject extends hudson.tasks.junit.TestObject {
      * Replaces URL-unsafe characters.
      */
     public static String safe(String s) {
-        // 3 replace calls is still 2-3x faster than a regex replaceAll
-        return s.replace('/', '_').replace('\\', '_').replace(':', '_');
+        // this still seems to be a bit faster than a single replace with regexp
+        return s.replace('/', '_').replace('\\', '_').replace(':', '_').replace('?', '_').replace('#', '_');
+        
+        // Note: we probably should some helpers like Commons URIEscapeUtils here to escape all invalid URL chars, but then we
+        // still would have to escape /, ? and so on
     }
 
     /**

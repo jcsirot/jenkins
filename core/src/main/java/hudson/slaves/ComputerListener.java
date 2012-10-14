@@ -24,7 +24,7 @@
 package hudson.slaves;
 
 import hudson.model.Computer;
-import hudson.model.Hudson;
+import jenkins.model.Jenkins;
 import hudson.model.TaskListener;
 import hudson.model.Node;
 import hudson.ExtensionPoint;
@@ -165,7 +165,27 @@ public abstract class ComputerListener implements ExtensionPoint {
     public void onOffline(Computer c) {}
 
     /**
+     * Indicates that the computer was marked as temporarily online by the administrator.
+     * This is the reverse operation of {@link #onTemporarilyOffline(Computer)}
+     *
+     * @since 1.452
+     */
+    public void onTemporarilyOnline(Computer c) {}
+    /**
+     * Indicates that the computer was marked as temporarily online by the administrator.
+     * This is the reverse operation of {@link #onTemporarilyOffline(Computer)}
+     *
+     * @since 1.452
+     */
+    public void onTemporarilyOffline(Computer c, OfflineCause cause) {}
+
+    /**
      * Called when configuration of the node was changed, a node is added/removed, etc.
+     *
+     * <p>
+     * This callback is to signal when there's any change to the list of slaves registered to the system,
+     * including addition, removal, changing of the setting, and so on.
+     *
      * @since 1.377
      */
     public void onConfigurationChange() {}
@@ -194,6 +214,6 @@ public abstract class ComputerListener implements ExtensionPoint {
      * All the registered {@link ComputerListener}s.
      */
     public static ExtensionList<ComputerListener> all() {
-        return Hudson.getInstance().getExtensionList(ComputerListener.class);
+        return Jenkins.getInstance().getExtensionList(ComputerListener.class);
     }
 }

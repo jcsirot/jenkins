@@ -28,6 +28,7 @@ import hudson.Plugin;
 import hudson.Extension;
 import hudson.ExtensionList;
 import hudson.util.DescriptorList;
+import jenkins.model.Jenkins;
 
 import java.util.List;
 
@@ -75,12 +76,18 @@ public abstract class PageDecorator extends Descriptor<PageDecorator> implements
      * @param yourClass
      *      pass-in "this.getClass()" (except that the constructor parameters cannot use 'this',
      *      so you'd have to hard-code the class name.
+     * @deprecated as of 1.425
+     *      Use the default constructor that's less error prone
      */
     protected PageDecorator(Class<? extends PageDecorator> yourClass) {
         super(yourClass);
     }
 
-// this will never work because Descriptor and Describable are the same thing.
+    protected PageDecorator() {
+        super(self());
+    }
+
+    // this will never work because Descriptor and Describable are the same thing.
 //    protected PageDecorator() {
 //    }
 
@@ -100,7 +107,7 @@ public abstract class PageDecorator extends Descriptor<PageDecorator> implements
      * Obtains the URL of this object, excluding the context path.
      *
      * <p>
-     * Every {@link PageDecorator} is bound to URL via {@link Hudson#getDescriptor()}.
+     * Every {@link PageDecorator} is bound to URL via {@link Jenkins#getDescriptor()}.
      * This method returns such an URL.
      */
     public final String getUrl() {
@@ -118,6 +125,6 @@ public abstract class PageDecorator extends Descriptor<PageDecorator> implements
      * Returns all the registered {@link PageDecorator} descriptors.
      */
     public static ExtensionList<PageDecorator> all() {
-        return Hudson.getInstance().<PageDecorator,PageDecorator>getDescriptorList(PageDecorator.class);
+        return Jenkins.getInstance().<PageDecorator,PageDecorator>getDescriptorList(PageDecorator.class);
     }
 }

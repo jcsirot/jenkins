@@ -24,28 +24,36 @@
 package hudson.model;
 
 import hudson.DescriptorExtensionList;
+import hudson.PluginWrapper;
 import hudson.RelativePath;
 import hudson.XmlFile;
 import hudson.BulkChange;
 import hudson.Util;
-import static hudson.Functions.jsStringEscape;
 import hudson.model.listeners.SaveableListener;
+import hudson.util.FormApply;
+import hudson.util.QuotedStringTokenizer;
 import hudson.util.ReflectionUtils;
 import hudson.util.ReflectionUtils.Parameter;
 import hudson.views.ListViewColumn;
+import jenkins.model.Jenkins;
 import net.sf.json.JSONArray;
 import net.sf.json.JSONObject;
 import org.kohsuke.stapler.*;
+import org.kohsuke.stapler.jelly.JellyCompatibleFacet;
+import org.kohsuke.stapler.lang.Klass;
 import org.springframework.util.StringUtils;
 import org.jvnet.tiger_types.Types;
 import org.apache.commons.io.IOUtils;
 
+import static hudson.Functions.*;
+import static hudson.util.QuotedStringTokenizer.*;
 import static javax.servlet.http.HttpServletResponse.SC_NOT_FOUND;
 import javax.servlet.ServletException;
 import javax.servlet.RequestDispatcher;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -132,18 +140,20 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
         public final Class clazz;
         public final Type type;
         private volatile Class itemType;
+        public final String displayName;
 
-        PropertyType(Class clazz, Type type) {
+        PropertyType(Class clazz, Type type, String displayName) {
             this.clazz = clazz;
             this.type = type;
+            this.displayName = displayName;
         }
 
         PropertyType(Field f) {
-            this(f.getType(),f.getGenericType());
+            this(f.getType(),f.getGenericType(),f.toString());
         }
 
         PropertyType(Method getter) {
-            this(getter.getReturnType(),getter.getGenericReturnType());
+            this(getter.getReturnType(),getter.getGenericReturnType(),getter.toString());
         }
 
         public Enum[] getEnumConstants() {
@@ -178,22 +188,48 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
          * Returns {@link Descriptor} whose 'clazz' is the same as {@link #getItemType() the item type}.
          */
         public Descriptor getItemTypeDescriptor() {
-            return Hudson.getInstance().getDescriptor(getItemType());
+            return Jenkins.getInstance().getDescriptor(getItemType());
         }
 
         public Descriptor getItemTypeDescriptorOrDie() {
-            return Hudson.getInstance().getDescriptorOrDie(getItemType());
+            Class it = getItemType();
+            Descriptor d = Jenkins.getInstance().getDescriptor(it);
+            if (d==null)
+                throw new AssertionError(it +" is missing its descriptor in "+displayName+". See https://wiki.jenkins-ci.org/display/JENKINS/My+class+is+missing+descriptor");
+            return d;
         }
 
         /**
-         * Returns all the descriptors that produce types assignable to the item type.
+         * Returns all the descriptors that produce types assignable to the property type.
          */
         public List<? extends Descriptor> getApplicableDescriptors() {
-            return Hudson.getInstance().getDescriptorList(clazz);
+            return Jenkins.getInstance().getDescriptorList(clazz);
+        }
+
+        /**
+         * Returns all the descriptors that produce types assignable to the item type for a collection property.
+         */
+        public List<? extends Descriptor> getApplicableItemDescriptors() {
+            return Jenkins.getInstance().getDescriptorList(getItemType());
         }
     }
 
+    /**
+     * Help file redirect, keyed by the field name to the path.
+     *
+     * @see #getHelpFile(String) 
+     */
+    private final Map<String,String> helpRedirect = new HashMap<String, String>();
+
+    /**
+     *
+     * @param clazz
+     *      Pass in {@link #self()} to have the descriptor describe itself,
+     *      (this hack is needed since derived types can't call "getClass()" to refer to itself.
+     */
     protected Descriptor(Class<? extends T> clazz) {
+        if (clazz==self())
+            clazz = (Class)getClass();
         this.clazz = clazz;
         // doing this turns out to be very error prone,
         // as field initializers in derived types will override values.
@@ -248,6 +284,9 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
      * but if you are adding {@link Descriptor}s programmatically for the same type, you can change
      * this to disambiguate them.
      *
+     * <p>
+     * To look up {@link Descriptor} from ID, use {@link Jenkins#getDescriptor(String)}.
+     *
      * @return
      *      Stick to valid Java identifier character, plus '.', which had to be allowed for historical reasons.
      * 
@@ -275,7 +314,7 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
 
     /**
      * Gets the URL that this Descriptor is bound to, relative to the nearest {@link DescriptorByNameOwner}.
-     * Since {@link Hudson} is a {@link DescriptorByNameOwner}, there's always one such ancestor to any request.
+     * Since {@link Jenkins} is a {@link DescriptorByNameOwner}, there's always one such ancestor to any request.
      */
     public String getDescriptorUrl() {
         return "descriptorByName/"+getId();
@@ -557,6 +596,15 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
     }
 
     /**
+     * Returns the {@link Klass} object used for the purpose of loading resources from this descriptor.
+     *
+     * This hook enables other JVM languages to provide more integrated lookup.
+     */
+    public Klass<?> getKlass() {
+        return Klass.java(clazz);
+    }
+
+    /**
      * Returns the resource path to the help screen HTML, if any.
      *
      * <p>
@@ -585,7 +633,14 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
      * locale variations.
      */
     public String getHelpFile(final String fieldName) {
-        for(Class c=clazz; c!=null; c=c.getSuperclass()) {
+        return getHelpFile(getKlass(),fieldName);
+    }
+
+    public String getHelpFile(Klass<?> clazz, String fieldName) {
+        String v = helpRedirect.get(fieldName);
+        if (v!=null)    return v;
+
+        for (Klass<?> c : clazz.getAncestors()) {
             String page = "/descriptor/" + getId() + "/help";
             String suffix;
             if(fieldName==null) {
@@ -602,11 +657,19 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
                 throw new Error(e);
             }
 
-            InputStream in = getHelpStream(c,suffix);
-            IOUtils.closeQuietly(in);
-            if(in!=null)    return page;
+            if(getStaticHelpUrl(c, suffix) !=null)    return page;
         }
         return null;
+    }
+    
+    /**
+     * Tells Jenkins that the help file for the field 'fieldName' is defined in the help file for
+     * the 'fieldNameToRedirectTo' in the 'owner' class.
+     * @since 1.425
+     */
+    protected void addHelpFileRedirect(String fieldName, Class<? extends Describable> owner, String fieldNameToRedirectTo) {
+        helpRedirect.put(fieldName,
+            Jenkins.getInstance().getDescriptor(owner).getHelpFile(fieldNameToRedirectTo));
     }
 
     /**
@@ -648,18 +711,24 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
     }
 
     public String getConfigPage() {
-        return getViewPage(clazz, "config.jelly");
+        return getViewPage(clazz, getPossibleViewNames("config"), "config.jelly");
     }
 
     public String getGlobalConfigPage() {
-        return getViewPage(clazz, "global.jelly",null);
+        return getViewPage(clazz, getPossibleViewNames("global"), null);
+    }
+    
+    private String getViewPage(Class<?> clazz, String pageName, String defaultValue) {
+        return getViewPage(clazz,Collections.singleton(pageName),defaultValue);
     }
 
-    private String getViewPage(Class<?> clazz, String pageName, String defaultValue) {
-        while(clazz!=Object.class) {
-            String name = clazz.getName().replace('.', '/').replace('$', '/') + "/" + pageName;
-            if(clazz.getClassLoader().getResource(name)!=null)
-                return '/'+name;
+    private String getViewPage(Class<?> clazz, Collection<String> pageNames, String defaultValue) {
+        while(clazz!=Object.class && clazz!=null) {
+            for (String pageName : pageNames) {
+                String name = clazz.getName().replace('.', '/').replace('$', '/') + "/" + pageName;
+                if(clazz.getClassLoader().getResource(name)!=null)
+                    return '/'+name;
+            }
             clazz = clazz.getSuperclass();
         }
         return defaultValue;
@@ -672,6 +741,18 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
         // Or this error is fatal, in which case we want the developer to see what page he's missing.
         // so we put the page name.
         return getViewPage(clazz,pageName,pageName);
+    }
+
+    protected List<String> getPossibleViewNames(String baseName) {
+        List<String> names = new ArrayList<String>();
+        for (Facet f : WebApp.get(Jenkins.getInstance().servletContext).facets) {
+            if (f instanceof JellyCompatibleFacet) {
+                JellyCompatibleFacet jcf = (JellyCompatibleFacet) f;
+                for (String ext : jcf.getScriptExtensions())
+                    names.add(baseName +ext);
+            }
+        }
+        return names;
     }
 
 
@@ -709,7 +790,17 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
     }
 
     private XmlFile getConfigFile() {
-        return new XmlFile(new File(Hudson.getInstance().getRootDir(),getId()+".xml"));
+        return new XmlFile(new File(Jenkins.getInstance().getRootDir(),getId()+".xml"));
+    }
+
+    /**
+     * Returns the plugin in which this descriptor is defined.
+     *
+     * @return
+     *      null to indicate that this descriptor came from the core.
+     */
+    protected PluginWrapper getPlugin() {
+        return Jenkins.getInstance().getPluginManager().whichPlugin(clazz);
     }
 
     /**
@@ -721,43 +812,53 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
 
         path = path.replace('/','-');
 
-        for (Class c=clazz; c!=null; c=c.getSuperclass()) {
+        PluginWrapper pw = getPlugin();
+        if (pw!=null) {
+            rsp.setHeader("X-Plugin-Short-Name",pw.getShortName());
+            rsp.setHeader("X-Plugin-Long-Name",pw.getLongName());
+            rsp.setHeader("X-Plugin-From", Messages.Descriptor_From(
+                    pw.getLongName().replace("Hudson","Jenkins").replace("hudson","jenkins"), pw.getUrl()));
+        }
+
+        for (Klass<?> c= getKlass(); c!=null; c=c.getSuperClass()) {
             RequestDispatcher rd = Stapler.getCurrentRequest().getView(c, "help"+path);
-            if(rd!=null) {// Jelly-generated help page
+            if(rd!=null) {// template based help page
                 rd.forward(req,rsp);
                 return;
             }
 
-            InputStream in = getHelpStream(c,path);
-            if(in!=null) {
+            URL url = getStaticHelpUrl(c, path);
+            if(url!=null) {
                 // TODO: generalize macro expansion and perhaps even support JEXL
                 rsp.setContentType("text/html;charset=UTF-8");
-                String literal = IOUtils.toString(in,"UTF-8");
-                rsp.getWriter().println(Util.replaceMacro(literal, Collections.singletonMap("rootURL",req.getContextPath())));
-                in.close();
+                InputStream in = url.openStream();
+                try {
+                    String literal = IOUtils.toString(in,"UTF-8");
+                    rsp.getWriter().println(Util.replaceMacro(literal, Collections.singletonMap("rootURL",req.getContextPath())));
+                } finally {
+                    IOUtils.closeQuietly(in);
+                }
                 return;
             }
         }
         rsp.sendError(SC_NOT_FOUND);
     }
 
-    private InputStream getHelpStream(Class c, String suffix) {
+    private URL getStaticHelpUrl(Klass<?> c, String suffix) {
         Locale locale = Stapler.getCurrentRequest().getLocale();
-        String base = c.getName().replace('.', '/').replace('$','/') + "/help"+suffix;
 
-        ClassLoader cl = c.getClassLoader();
-        if(cl==null)    return null;
-        
-        InputStream in;
-        in = cl.getResourceAsStream(base + '_' + locale.getLanguage() + '_' + locale.getCountry() + '_' + locale.getVariant() + ".html");
-        if(in!=null)    return in;
-        in = cl.getResourceAsStream(base + '_' + locale.getLanguage() + '_' + locale.getCountry() + ".html");
-        if(in!=null)    return in;
-        in = cl.getResourceAsStream(base + '_' + locale.getLanguage() + ".html");
-        if(in!=null)    return in;
+        String base = "help"+suffix;
+
+        URL url;
+        url = c.getResource(base + '_' + locale.getLanguage() + '_' + locale.getCountry() + '_' + locale.getVariant() + ".html");
+        if(url!=null)    return url;
+        url = c.getResource(base + '_' + locale.getLanguage() + '_' + locale.getCountry() + ".html");
+        if(url!=null)    return url;
+        url = c.getResource(base + '_' + locale.getLanguage() + ".html");
+        if(url!=null)    return url;
 
         // default
-        return cl.getResourceAsStream(base+".html");
+        return c.getResource(base + ".html");
     }
 
 
@@ -830,11 +931,17 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
             if(d.getClass().getName().equals(className))
                 return d;
         }
+        // Since we introduced Descriptor.getId(), it is a preferred method of identifying descriptor by a string.
+        // To make that migration easier without breaking compatibility, let's also match up with the id.
+        for (T d : list) {
+            if(d.getId().equals(className))
+                return d;
+        }
         return null;
     }
 
     public static Descriptor find(String className) {
-        return find(Hudson.getInstance().getExtensionList(Descriptor.class),className);
+        return find(Jenkins.getInstance().getExtensionList(Descriptor.class),className);
     }
 
     public static final class FormException extends Exception implements HttpResponse {
@@ -863,8 +970,13 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
         }
 
         public void generateResponse(StaplerRequest req, StaplerResponse rsp, Object node) throws IOException, ServletException {
-            // for now, we can't really use the field name that caused the problem.
-            new Failure(getMessage()).generateResponse(req,rsp,node);
+            if (FormApply.isApply(req)) {
+                FormApply.applyResponse("notificationBar.show(" + quote(getMessage())+ ",notificationBar.defaultOptions.ERROR)")
+                        .generateResponse(req, rsp, node);
+            } else {
+                // for now, we can't really use the field name that caused the problem.
+                new Failure(getMessage()).generateResponse(req,rsp,node);
+            }
         }
     }
 
@@ -874,4 +986,12 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
      * Used in {@link #checkMethods} to indicate that there's no check method.
      */
     private static final String NONE = "\u0000";
+
+    /**
+     * Special type indicating that {@link Descriptor} describes itself.
+     * @see Descriptor#Descriptor(Class)
+     */
+    public static final class Self {}
+
+    protected static Class self() { return Self.class; }
 }

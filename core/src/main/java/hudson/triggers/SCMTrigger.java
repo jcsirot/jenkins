@@ -31,7 +31,7 @@ import hudson.model.AbstractBuild;
 import hudson.model.AbstractProject;
 import hudson.model.Action;
 import hudson.model.Cause;
-import hudson.model.Hudson;
+import jenkins.model.Jenkins;
 import hudson.model.Item;
 import hudson.model.Project;
 import hudson.model.SCMedItem;
@@ -91,7 +91,7 @@ public class SCMTrigger extends Trigger<SCMedItem> {
      * @since 1.375
      */
     public void run(Action[] additionalActions) {
-        if(Hudson.getInstance().isQuietingDown())
+        if(Jenkins.getInstance().isQuietingDown())
             return; // noop
 
         DescriptorImpl d = getDescriptor();
@@ -425,18 +425,18 @@ public class SCMTrigger extends Trigger<SCMedItem> {
                         logger.println("No changes");
                     return result;
                 } catch (Error e) {
-                    e.printStackTrace(listener.error("Failed to record SCM polling"));
-                    LOGGER.log(Level.SEVERE,"Failed to record SCM polling",e);
+                    e.printStackTrace(listener.error("Failed to record SCM polling for "+job));
+                    LOGGER.log(Level.SEVERE,"Failed to record SCM polling for "+job,e);
                     throw e;
                 } catch (RuntimeException e) {
-                    e.printStackTrace(listener.error("Failed to record SCM polling"));
-                    LOGGER.log(Level.SEVERE,"Failed to record SCM polling",e);
+                    e.printStackTrace(listener.error("Failed to record SCM polling for "+job));
+                    LOGGER.log(Level.SEVERE,"Failed to record SCM polling for "+job,e);
                     throw e;
                 } finally {
                     listener.close();
                 }
             } catch (IOException e) {
-                LOGGER.log(Level.SEVERE,"Failed to record SCM polling",e);
+                LOGGER.log(Level.SEVERE,"Failed to record SCM polling for "+job,e);
                 return false;
             }
         }

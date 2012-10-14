@@ -34,6 +34,7 @@ import java.util.AbstractList;
 
 import javax.servlet.ServletException;
 
+import jenkins.model.Jenkins;
 import net.sf.json.JSONArray;
 import net.sf.json.JSONObject;
 
@@ -43,6 +44,7 @@ import org.kohsuke.stapler.export.Exported;
 import org.kohsuke.stapler.export.ExportedBean;
 
 import hudson.Extension;
+import org.kohsuke.stapler.export.Flavor;
 
 /**
  * Keeps a list of the parameters defined for a project.
@@ -127,8 +129,8 @@ public class ParametersDefinitionProperty extends JobProperty<AbstractProject<?,
             values.add(parameterValue);
         }
 
-    	Hudson.getInstance().getQueue().schedule(
-                owner, owner.getDelay(req), new ParametersAction(values), new CauseAction(new Cause.UserCause()));
+    	Jenkins.getInstance().getQueue().schedule(
+                owner, owner.getDelay(req), new ParametersAction(values), new CauseAction(new Cause.UserIdCause()));
 
         // send the user back to the job top page.
         rsp.sendRedirect(".");
@@ -140,16 +142,25 @@ public class ParametersDefinitionProperty extends JobProperty<AbstractProject<?,
         	ParameterValue value = d.createValue(req);
         	if (value != null) {
         		values.add(value);
-        	} else {
-        		throw new IllegalArgumentException("Parameter " + d.getName() + " was missing.");
         	}
         }
 
-    	Hudson.getInstance().getQueue().schedule(
+        Jenkins.getInstance().getQueue().schedule(
                 owner, owner.getDelay(req), new ParametersAction(values), owner.getBuildCause(req));
 
-        // send the user back to the job top page.
-        rsp.sendRedirect(".");
+        if (requestWantsJson(req)) {
+            rsp.setContentType("application/json");
+            rsp.serveExposedBean(req, owner, Flavor.JSON);
+        } else {
+            // send the user back to the job top page.
+            rsp.sendRedirect(".");
+        }
+    }
+
+    private boolean requestWantsJson(StaplerRequest req) {
+        String a = req.getHeader("Accept");
+        if (a==null)    return false;
+        return !a.contains("text/html") && a.contains("application/json");
     }
 
     /**

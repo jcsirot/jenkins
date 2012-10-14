@@ -23,29 +23,29 @@
  */
 package hudson.tasks;
 
+import com.google.common.collect.Lists;
 import hudson.model.Describable;
 import hudson.model.Descriptor;
 import hudson.model.Job;
 import hudson.model.Run;
-import hudson.scm.SCM;
-
 import org.kohsuke.stapler.DataBoundConstructor;
 
 import java.io.IOException;
 import java.util.Calendar;
+import java.util.Collection;
 import java.util.GregorianCalendar;
-import static java.util.logging.Level.FINE;
-import static java.util.logging.Level.FINER;
-
 import java.util.List;
 import java.util.logging.Logger;
 
+import static java.util.logging.Level.*;
+
 /**
- * Deletes old log files.
- *
- * TODO: is there any other task that follows the same pattern?
- * try to generalize this just like {@link SCM} or {@link BuildStep}.
- *
+ * Deletes old builds.
+ * 
+ * Historically this is called LogRotator, though it deletes the whole build including all artifacts.
+ * 
+ * Since 1.350 it has also the option to keep the build, but delete its recorded artifacts.
+ * 
  * @author Kohsuke Kawaguchi
  */
 public class LogRotator implements Describable<LogRotator> {
@@ -105,16 +105,17 @@ public class LogRotator implements Describable<LogRotator> {
         
     }
 
+    @SuppressWarnings("rawtypes")
     public void perform(Job<?,?> job) throws IOException, InterruptedException {
         LOGGER.log(FINE,"Running the log rotation for "+job.getFullDisplayName());
         
-        // keep the last successful build regardless of the status
+        // always keep the last successful and the last stable builds
         Run lsb = job.getLastSuccessfulBuild();
         Run lstb = job.getLastStableBuild();
 
         if(numToKeep!=-1) {
             List<? extends Run<?,?>> builds = job.getBuilds();
-            for (Run r : builds.subList(Math.min(builds.size(),numToKeep),builds.size())) {
+            for (Run r : copy(builds.subList(Math.min(builds.size(), numToKeep), builds.size()))) {
                 if (r.isKeepLog()) {
                     LOGGER.log(FINER,r.getFullDisplayName()+" is not GC-ed because it's marked as a keeper");
                     continue;
@@ -135,8 +136,7 @@ public class LogRotator implements Describable<LogRotator> {
         if(daysToKeep!=-1) {
             Calendar cal = new GregorianCalendar();
             cal.add(Calendar.DAY_OF_YEAR,-daysToKeep);
-            // copy it to the array because we'll be deleting builds as we go.
-            for( Run r : job.getBuilds() ) {
+            for( Run r : copy(job.getBuilds()) ) {
                 if (r.isKeepLog()) {
                     LOGGER.log(FINER,r.getFullDisplayName()+" is not GC-ed because it's marked as a keeper");
                     continue;
@@ -160,7 +160,7 @@ public class LogRotator implements Describable<LogRotator> {
 
         if(artifactNumToKeep!=null && artifactNumToKeep!=-1) {
             List<? extends Run<?,?>> builds = job.getBuilds();
-            for (Run r : builds.subList(Math.min(builds.size(),artifactNumToKeep),builds.size())) {
+            for (Run r : copy(builds.subList(Math.min(builds.size(), artifactNumToKeep), builds.size()))) {
                 if (r.isKeepLog()) {
                     LOGGER.log(FINER,r.getFullDisplayName()+" is not purged of artifacts because it's marked as a keeper");
                     continue;
@@ -180,8 +180,7 @@ public class LogRotator implements Describable<LogRotator> {
         if(artifactDaysToKeep!=null && artifactDaysToKeep!=-1) {
             Calendar cal = new GregorianCalendar();
             cal.add(Calendar.DAY_OF_YEAR,-artifactDaysToKeep);
-            // copy it to the array because we'll be deleting builds as we go.
-            for( Run r : job.getBuilds() ) {
+            for( Run r : copy(job.getBuilds())) {
                 if (r.isKeepLog()) {
                     LOGGER.log(FINER,r.getFullDisplayName()+" is not purged of artifacts because it's marked as a keeper");
                     continue;
@@ -201,7 +200,13 @@ public class LogRotator implements Describable<LogRotator> {
                 r.deleteArtifacts();
             }
         }
+    }
 
+    /**
+     * Creates a copy since we'll be deleting some entries from them.
+     */
+    private <R> Collection<R> copy(Iterable<R> src) {
+        return Lists.newArrayList(src);
     }
 
     public int getDaysToKeep() {

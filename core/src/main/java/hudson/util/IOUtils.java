@@ -1,9 +1,8 @@
 package hudson.util;
 
-import hudson.FilePath.FileCallable;
 import hudson.Functions;
 import hudson.os.PosixAPI;
-import hudson.remoting.VirtualChannel;
+import hudson.os.PosixException;
 
 import java.io.*;
 import java.util.regex.Pattern;
@@ -117,11 +116,30 @@ public class IOUtils extends org.apache.commons.io.IOUtils {
 
 
     /**
-     * Gets the mode of a file/directory, if appropriate. Returns -1 if not on Unix.
+     * Gets the mode of a file/directory, if appropriate.
+     * @return a file mode, or -1 if not on Unix
+     * @throws PosixException if the file could not be statted, e.g. broken symlink
      */
-    public static int mode(File f) {
+    public static int mode(File f) throws PosixException {
         if(Functions.isWindows())   return -1;
         return PosixAPI.get().stat(f.getPath()).mode();
+    }
+
+    /**
+     * Read the first line of the given stream, close it, and return that line.
+     *
+     * @param encoding
+     *      If null, use the platform default encoding.
+     * @since 1.422
+     */
+    public static String readFirstLine(InputStream is, String encoding) throws IOException {
+        BufferedReader reader = new BufferedReader(
+                encoding==null ? new InputStreamReader(is) : new InputStreamReader(is,encoding));
+        try {
+            return reader.readLine();
+        } finally {
+            reader.close();
+        }
     }
 
     private static final byte[] SKIP_BUFFER = new byte[8192];

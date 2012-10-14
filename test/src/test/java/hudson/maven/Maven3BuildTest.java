@@ -21,7 +21,6 @@ package hudson.maven;
  */
 
 import hudson.Launcher;
-import hudson.maven.reporters.SurefireReport;
 import hudson.model.*;
 import hudson.tasks.Maven.MavenInstallation;
 
@@ -30,7 +29,6 @@ import java.io.FilenameFilter;
 import java.io.IOException;
 
 import hudson.tasks.test.AbstractTestResultAction;
-import hudson.tasks.test.TestResult;
 import hudson.tasks.test.TestResultProjectAction;
 import org.apache.commons.io.FileUtils;
 import org.jvnet.hudson.test.Bug;
@@ -204,6 +202,32 @@ public class Maven3BuildTest extends HudsonTestCase {
         m.setMaven( mavenInstallation.getName() );
         m.getReporters().add(new TestReporter());
         m.setScm(new ExtractResourceSCM(getClass().getResource("JENKINS-9326.zip"),"foobar"));
+        m.setGoals("verify");
+        buildAndAssertSuccess(m);
+
+        System.out.println("modules size " + m.getModules());
+
+
+        MavenModule testModule = null;
+        for (MavenModule mavenModule : m.getModules()) {
+            System.out.println("module " + mavenModule.getName() + "/" + mavenModule.getDisplayName());
+            if ("org.foobar:org.foobar.test".equals( mavenModule.getName() )) testModule = mavenModule;
+        }
+
+        AbstractTestResultAction trpa = testModule.getLastBuild().getTestResultAction();
+
+        int totalCount = trpa.getTotalCount();
+        assertEquals(1, totalCount);
+    }
+
+    @Bug(9326)
+    public void testTychoEclipseTestResults() throws Exception {
+        MavenInstallation mavenInstallation = configureMaven3();
+        MavenModuleSet m = createMavenProject();
+        m.setRootPOM( "org.foobar.build/pom.xml" );
+        m.setMaven( mavenInstallation.getName() );
+        m.getReporters().add(new TestReporter());
+        m.setScm(new ExtractResourceSCM(getClass().getResource("foobar_eclipse_with_fix.zip"),"foobar_eclipse"));
         m.setGoals("verify");
         buildAndAssertSuccess(m);
 

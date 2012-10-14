@@ -30,8 +30,11 @@ import hudson.Extension;
 import hudson.node_monitors.ArchitectureMonitor.DescriptorImpl;
 import hudson.util.Secret;
 import static hudson.util.TimeUnit2.DAYS;
+
+import jenkins.model.Jenkins;
 import net.sf.json.JSONObject;
 import org.apache.commons.io.output.ByteArrayOutputStream;
+import org.kohsuke.stapler.StaplerRequest;
 
 import javax.crypto.Cipher;
 import javax.crypto.CipherOutputStream;
@@ -83,7 +86,6 @@ public class UsageStatistics extends PageDecorator {
      * Creates an instance with a specific public key image.
      */
     public UsageStatistics(String keyImage) {
-        super(UsageStatistics.class);
         this.keyImage = keyImage;
         load();
     }
@@ -93,7 +95,7 @@ public class UsageStatistics extends PageDecorator {
      */
     public boolean isDue() {
         // user opted out. no data collection.
-        if(!Hudson.getInstance().isUsageStatisticsCollected() || DISABLED)     return false;
+        if(!Jenkins.getInstance().isUsageStatisticsCollected() || DISABLED)     return false;
         
         long now = System.currentTimeMillis();
         if(now - lastAttempt > DAY) {
@@ -119,12 +121,13 @@ public class UsageStatistics extends PageDecorator {
      * Gets the encrypted usage stat data to be sent to the Hudson server.
      */
     public String getStatData() throws IOException {
-        Hudson h = Hudson.getInstance();
+        Jenkins h = Jenkins.getInstance();
 
         JSONObject o = new JSONObject();
         o.put("stat",1);
         o.put("install", Util.getDigestOf(h.getSecretKey()));
-        o.put("version",Hudson.VERSION);
+        o.put("servletContainer",h.servletContext.getServerInfo());
+        o.put("version", Jenkins.VERSION);
 
         List<JSONObject> nodes = new ArrayList<JSONObject>();
         for( Computer c : h.getComputers() ) {
@@ -174,6 +177,17 @@ public class UsageStatistics extends PageDecorator {
             return new String(Base64.encode(baos.toByteArray()));
         } catch (GeneralSecurityException e) {
             throw new Error(e); // impossible
+        }
+    }
+
+    @Override
+    public boolean configure(StaplerRequest req, JSONObject json) throws FormException {
+        try {
+            // for backward compatibility reasons, this configuration is stored in Jenkins
+            Jenkins.getInstance().setNoUsageStatistics(json.has("usageStatisticsCollected") ? null : true);
+            return true;
+        } catch (IOException e) {
+            throw new FormException(e,"usageStatisticsCollected");
         }
     }
 

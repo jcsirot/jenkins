@@ -11,7 +11,8 @@ complete {
 
 
     match("asm:*") {
-        rewriteLicense([], license("BSD License","http://asm.ow2.org/license.html"))
+        if (dependency.licenses.isEmpty())
+            rewriteLicense([], license("BSD License","http://asm.ow2.org/license.html"))
     }
 
     // Apache components
@@ -46,7 +47,7 @@ complete {
         rewriteLicense([],license("BSD License","http://dom4j.sourceforge.net/dom4j-1.6.1/license.html"))
     }
 
-    match(["org.codehaus.groovy:*","*:jmdns"]) {
+    match(["org.codehaus.groovy:*","org.jenkins-ci.groovy:*"]) {
         // see http://groovy.codehaus.org/License+Information
         // see http://jmdns.sourceforge.net/license.html
         rewriteLicense([],apacheLicense)
@@ -67,7 +68,7 @@ complete {
 
     // these are our own modules that have license in the trunk but not in these released versions
     // as we upgrade them, we should just pick up the license info from POM
-    match(["org.jenkins-ci.modules:instance-identity","org.jvnet.hudson:task-reactor","org.jvnet.hudson:annotation-indexer","*:jinterop-wmi","*:maven2.1-interceptor","*:lib-jenkins-maven-embedder"]) {
+    match(["org.jvnet.hudson:task-reactor","org.jvnet.hudson:annotation-indexer","*:jinterop-wmi","*:maven2.1-interceptor","*:lib-jenkins-maven-embedder"]) {
         rewriteLicense([],jenkinsLicense)
     }
 
@@ -75,7 +76,7 @@ complete {
         rewriteLicense([],lgpl)
     }
 
-    match(["org.jvnet.localizer:localizer","*:trilead-putty-extension"]) {
+    match(["org.jvnet.localizer:localizer"]) {
         // see http://java.net/projects/localizer
         // see http://java.net/projects/trilead-putty-extension/
         rewriteLicense([],mitLicense);
@@ -95,7 +96,10 @@ complete {
     }
            
 
-
+    match("nekohtml:xercesMinimal:1.9.6.2") {
+        if (dependency.licenses.isEmpty())
+            rewriteLicense([], apacheLicense)
+    }    
 
     //
     // Choose from multi-licensed modules
@@ -104,4 +108,5 @@ complete {
     match("*:jna-posix") {
         accept("GNU Lesser General Public License Version 2.1")
     }
+
 }

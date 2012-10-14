@@ -27,8 +27,10 @@ import hudson.ExtensionList;
 import hudson.ExtensionPoint;
 import hudson.triggers.SafeTimerTask;
 import hudson.triggers.Trigger;
+import jenkins.model.Jenkins;
 
 import java.util.Random;
+import java.util.Timer;
 import java.util.logging.Logger;
 
 
@@ -73,13 +75,20 @@ public abstract class AperiodicWork extends SafeTimerTask implements ExtensionPo
      * By default it chooses the value randomly between 0 and {@link #getRecurrencePeriod()}
      */
     public long getInitialDelay() {
-        return Math.abs(new Random().nextLong())%getRecurrencePeriod();
+        long l = RANDOM.nextLong();
+        // Math.abs(Long.MIN_VALUE)==Long.MIN_VALUE!
+        if (l==Long.MIN_VALUE)
+            l++;
+        return Math.abs(l)%getRecurrencePeriod();
     }
 
     @Override
     public final void doRun() throws Exception{
     	doAperiodicRun();
-    	Trigger.timer.schedule(getNewInstance(), getRecurrencePeriod());
+        Timer timer = Trigger.timer;
+        if (timer != null) {
+            timer.schedule(getNewInstance(), getRecurrencePeriod());
+        }
     }
     
     protected abstract void doAperiodicRun();
@@ -88,7 +97,8 @@ public abstract class AperiodicWork extends SafeTimerTask implements ExtensionPo
      * Returns all the registered {@link AperiodicWork}s.
      */
     public static ExtensionList<AperiodicWork> all() {
-        return Hudson.getInstance().getExtensionList(AperiodicWork.class);
+        return Jenkins.getInstance().getExtensionList(AperiodicWork.class);
     }
 
+    private static final Random RANDOM = new Random();
 }

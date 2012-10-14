@@ -27,7 +27,7 @@ package hudson;
 
 import hudson.Launcher.LocalLauncher;
 import hudson.Launcher.RemoteLauncher;
-import hudson.model.Hudson;
+import jenkins.model.Jenkins;
 import hudson.model.TaskListener;
 import hudson.model.AbstractProject;
 import hudson.model.Item;
@@ -46,8 +46,9 @@ import hudson.util.IOException2;
 import hudson.util.HeadBufferingStream;
 import hudson.util.FormValidation;
 import hudson.util.IOUtils;
+
+import static hudson.Util.*;
 import static hudson.util.jna.GNUCLibrary.LIBC;
-import static hudson.Util.fixEmpty;
 import static hudson.FilePath.TarCompression.GZIP;
 import hudson.org.apache.tools.tar.TarInputStream;
 import hudson.util.io.Archiver;
@@ -61,9 +62,6 @@ import org.apache.tools.tar.TarEntry;
 import org.apache.commons.io.input.CountingInputStream;
 import org.apache.commons.fileupload.FileItem;
 import org.kohsuke.stapler.Stapler;
-import org.jvnet.robust_http_client.RetryableHttpStream;
-
-import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileFilter;
@@ -78,6 +76,7 @@ import java.io.OutputStream;
 import java.io.Serializable;
 import java.io.Writer;
 import java.io.OutputStreamWriter;
+import java.lang.reflect.Field;
 import java.net.URI;
 import java.net.URL;
 import java.net.URLConnection;
@@ -94,12 +93,15 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.zip.GZIPOutputStream;
 import java.util.zip.GZIPInputStream;
-import java.util.zip.ZipInputStream;
 
 import com.sun.jna.Native;
+import java.util.Enumeration;
 import java.util.logging.Logger;
 import org.apache.tools.ant.taskdefs.Chmod;
 
+import org.apache.tools.zip.ZipFile;
+import org.apache.tools.zip.ZipEntry;
+        
 /**
  * {@link File} like object with remoting support.
  *
@@ -211,17 +213,24 @@ public final class FilePath implements Serializable {
      */
     public FilePath(FilePath base, String rel) {
         this.channel = base.channel;
-        if(isAbsolute(rel)) {
-            // absolute
-            this.remote = normalize(rel);
-        } else 
+        this.remote = normalize(resolvePathIfRelative(base, rel));
+    }
+
+    private String resolvePathIfRelative(FilePath base, String rel) {
+        if(isAbsolute(rel)) return rel;
         if(base.isUnix()) {
-            this.remote = normalize(base.remote+'/'+rel);
+            // shouldn't need this replace, but better safe than sorry
+            return base.remote+'/'+rel.replace('\\','/');
         } else {
-            this.remote = normalize(base.remote+'\\'+rel);
+            // need this replace, see Slave.getWorkspaceFor and AbstractItem.getFullName, nested jobs on Windows
+            // slaves will always have a rel containing at least one '/' character. JENKINS-13649
+            return base.remote+'\\'+rel.replace('/','\\');
         }
     }
 
+    /**
+     * Is the given path name an absolute path?
+     */
     private static boolean isAbsolute(String rel) {
         return rel.startsWith("/") || DRIVE_PATTERN.matcher(rel).matches();
     }
@@ -291,7 +300,7 @@ public final class FilePath implements Serializable {
     /**
      * Checks if the remote path is Unix.
      */
-    private boolean isUnix() {
+    boolean isUnix() {
         // if the path represents a local path, there' no need to guess.
         if(!isRemote())
             return File.pathSeparatorChar!=';';
@@ -307,6 +316,10 @@ public final class FilePath implements Serializable {
         return remote.indexOf("\\")==-1;
     }
 
+    /**
+     * Gets the full path of the file on the remote machine.
+     *
+     */
     public String getRemote() {
         return remote;
     }
@@ -327,6 +340,15 @@ public final class FilePath implements Serializable {
         zip(os,(FileFilter)null);
     }
 
+    public void zip(FilePath dst) throws IOException, InterruptedException {
+        OutputStream os = dst.write();
+        try {
+            zip(os);
+        } finally {
+            os.close();
+        }
+    }
+    
     /**
      * Creates a zip file from this directory by using the specified filter,
      * and sends the result to the given output stream.
@@ -400,11 +422,11 @@ public final class FilePath implements Serializable {
         });
     }
 
-    private int archive(final ArchiverFactory factory, OutputStream os, final FileFilter filter) throws IOException, InterruptedException {
+    public int archive(final ArchiverFactory factory, OutputStream os, final FileFilter filter) throws IOException, InterruptedException {
         return archive(factory,os,new DirScanner.Filter(filter));
     }
 
-    private int archive(final ArchiverFactory factory, OutputStream os, final String glob) throws IOException, InterruptedException {
+    public int archive(final ArchiverFactory factory, OutputStream os, final String glob) throws IOException, InterruptedException {
         return archive(factory,os,new DirScanner.Glob(glob,null));
     }
 
@@ -418,8 +440,12 @@ public final class FilePath implements Serializable {
      */
     public void unzip(final FilePath target) throws IOException, InterruptedException {
         target.act(new FileCallable<Void>() {
+
             public Void invoke(File dir, VirtualChannel channel) throws IOException {
-                unzip(dir,FilePath.this.read());
+                if (FilePath.this.isRemote())
+                    unzip(dir, FilePath.this.read()); // use streams
+                else
+                    unzip(dir, new File(FilePath.this.getRemote())); // shortcut to local file
                 return null;
             }
             private static final long serialVersionUID = 1L;
@@ -466,21 +492,43 @@ public final class FilePath implements Serializable {
     }
 
     private void unzip(File dir, InputStream in) throws IOException {
+        File tmpFile = File.createTempFile("tmpzip", null); // uses java.io.tmpdir
+        try {
+            IOUtils.copy(in, tmpFile);
+            unzip(dir,tmpFile);
+        }
+        finally {
+            tmpFile.delete();
+        }
+    }
+
+    private void unzip(File dir, File zipFile) throws IOException {
         dir = dir.getAbsoluteFile();    // without absolutization, getParentFile below seems to fail
-        ZipInputStream zip = new ZipInputStream(new BufferedInputStream(in));
-        java.util.zip.ZipEntry e;
+        ZipFile zip = new ZipFile(zipFile);
+        @SuppressWarnings("unchecked")
+        Enumeration<ZipEntry> entries = zip.getEntries();
 
         try {
-            while((e=zip.getNextEntry())!=null) {
-                File f = new File(dir,e.getName());
-                if(e.isDirectory()) {
+            while (entries.hasMoreElements()) {
+                ZipEntry e = entries.nextElement();
+                File f = new File(dir, e.getName());
+                if (e.isDirectory()) {
                     f.mkdirs();
                 } else {
                     File p = f.getParentFile();
-                    if(p!=null) p.mkdirs();
-                    IOUtils.copy(zip, f);
+                    if (p != null) {
+                        p.mkdirs();
+                    }
+                    IOUtils.copy(zip.getInputStream(e), f);
+                    try {
+                        FilePath target = new FilePath(f);
+                        int mode = e.getUnixMode();
+                        if (mode!=0)    // Ant returns 0 if the archive doesn't record the access mode
+                            target.chmod(mode);
+                    } catch (InterruptedException ex) {
+                        LOGGER.log(Level.WARNING, "unable to set permissions", ex);
+                    }
                     f.setLastModified(e.getTime());
-                    zip.closeEntry();
                 }
             }
         } finally {
@@ -497,6 +545,39 @@ public final class FilePath implements Serializable {
                 return f.getAbsolutePath();
             }
         }));
+    }
+
+    /**
+     * Creates a symlink to the specified target.
+     *
+     * @param target
+     *      The file that the symlink should point to.
+     * @param listener
+     *      If symlink creation requires a help of an external process, the error will be reported here.
+     * @since 1.456
+     */
+    public void symlinkTo(final String target, final TaskListener listener) throws IOException, InterruptedException {
+        act(new FileCallable<Void>() {
+            public Void invoke(File f, VirtualChannel channel) throws IOException, InterruptedException {
+                Util.createSymlink(f.getParentFile(),target,f.getName(),listener);
+                return null;
+            }
+        });
+    }
+    
+    /**
+     * Resolves symlink, if the given file is a symlink. Otherwise return null.
+     * <p>
+     * If the resolution fails, report an error.
+     *
+     * @since 1.456
+     */
+    public String readLink() throws IOException, InterruptedException {
+        return act(new FileCallable<String>() {
+            public String invoke(File f, VirtualChannel channel) throws IOException, InterruptedException {
+                return Util.resolveSymlink(f);
+            }
+        });
     }
 
     @Override
@@ -630,7 +711,7 @@ public final class FilePath implements Serializable {
                 listener.getLogger().println(message);
 
             // for HTTP downloads, enable automatic retry for added resilience
-            InputStream in = archive.getProtocol().equals("http") ? new RetryableHttpStream(archive) : con.getInputStream();
+            InputStream in = archive.getProtocol().startsWith("http") ? ProxyConfiguration.getInputStream(archive) : con.getInputStream();
             CountingInputStream cis = new CountingInputStream(in);
             try {
                 if(archive.toExternalForm().endsWith(".zip"))
@@ -678,7 +759,7 @@ public final class FilePath implements Serializable {
     }
 
     /**
-     * Conveniene method to call {@link FilePath#copyTo(FilePath)}.
+     * Convenience method to call {@link FilePath#copyTo(FilePath)}.
      * 
      * @since 1.311
      */
@@ -704,8 +785,11 @@ public final class FilePath implements Serializable {
             try {
                 IOUtils.copy(i,o);
             } finally {
-                o.close();
-                i.close();
+                try {
+                    o.close();
+                } finally {
+                    i.close();
+                }
             }
         }
     }
@@ -716,7 +800,7 @@ public final class FilePath implements Serializable {
      *
      * @see FilePath#act(FileCallable)
      */
-    public static interface FileCallable<T> extends Serializable {
+    public interface FileCallable<T> extends Serializable {
         /**
          * Performs the computational task on the node where the data is located.
          *
@@ -744,9 +828,18 @@ public final class FilePath implements Serializable {
         if(channel!=null) {
             // run this on a remote system
             try {
-                return channel.call(new FileCallableWrapper<T>(callable,cl));
+                DelegatingCallable<T,IOException> wrapper = new FileCallableWrapper<T>(callable, cl);
+                Jenkins instance = Jenkins.getInstance();
+                if (instance != null) { // this happens during unit tests
+                    ExtensionList<FileCallableWrapperFactory> factories = instance.getExtensionList(FileCallableWrapperFactory.class);
+                    for (FileCallableWrapperFactory factory : factories) {
+                        wrapper = factory.wrap(wrapper);
+                    }
+                }
+
+                return channel.call(wrapper);
             } catch (TunneledInterruptedException e) {
-                throw (InterruptedException)new InterruptedException().initCause(e);
+                throw (InterruptedException)new InterruptedException(e.getMessage()).initCause(e);
             } catch (AbortException e) {
                 throw e;    // pass through so that the caller can catch it as AbortException
             } catch (IOException e) {
@@ -755,9 +848,63 @@ public final class FilePath implements Serializable {
             }
         } else {
             // the file is on the local machine.
-            return callable.invoke(new File(remote), Hudson.MasterComputer.localChannel);
+            return callable.invoke(new File(remote), Jenkins.MasterComputer.localChannel);
         }
     }
+
+    /**
+     * This extension point allows to contribute a wrapper around a fileCallable so that a plugin can "intercept" a
+     * call.
+     * <p>The {@link #wrap(hudson.remoting.DelegatingCallable)} method itself will be executed on master
+     * (and may collect contextual data if needed) and the returned wrapper will be executed on remote.
+     *
+     * @since 1.482
+     * @see AbstractInterceptorCallableWrapper
+     */
+    public static abstract class FileCallableWrapperFactory implements ExtensionPoint {
+
+        public abstract <T> DelegatingCallable<T,IOException> wrap(DelegatingCallable<T,IOException> callable);
+
+    }
+
+    /**
+     * Abstract {@link DelegatingCallable} that exposes an Before/After pattern for
+     * {@link hudson.FilePath.FileCallableWrapperFactory} that want to implement AOP-style interceptors
+     * @since 1.482
+     */
+    public static abstract class AbstractInterceptorCallableWrapper<T> implements DelegatingCallable<T, IOException> {
+
+        private final DelegatingCallable<T, IOException> callable;
+
+        public AbstractInterceptorCallableWrapper(DelegatingCallable<T, IOException> callable) {
+            this.callable = callable;
+        }
+
+        @Override
+        public final ClassLoader getClassLoader() {
+            return callable.getClassLoader();
+        }
+
+        public final T call() throws IOException {
+            before();
+            try {
+                return callable.call();
+            } finally {
+                after();
+            }
+        }
+
+        /**
+         * Executed before the actual FileCallable is invoked. This code will run on remote
+         */
+        protected void before() {}
+
+        /**
+         * Executed after the actual FileCallable is invoked (even if this one failed). This code will run on remote
+         */
+        protected void after() {}
+    }
+
 
     /**
      * Executes some program on the machine that this {@link FilePath} exists,
@@ -765,8 +912,17 @@ public final class FilePath implements Serializable {
      */
     public <T> Future<T> actAsync(final FileCallable<T> callable) throws IOException, InterruptedException {
         try {
-            return (channel!=null ? channel : Hudson.MasterComputer.localChannel)
-                .callAsync(new FileCallableWrapper<T>(callable));
+            DelegatingCallable<T,IOException> wrapper = new FileCallableWrapper<T>(callable);
+            Jenkins instance = Jenkins.getInstance();
+            if (instance != null) { // this happens during unit tests
+                ExtensionList<FileCallableWrapperFactory> factories = instance.getExtensionList(FileCallableWrapperFactory.class);
+                for (FileCallableWrapperFactory factory : factories) {
+                    wrapper = factory.wrap(wrapper);
+                }
+            }
+
+            return (channel!=null ? channel : Jenkins.MasterComputer.localChannel)
+                .callAsync(wrapper);
         } catch (IOException e) {
             // wrap it into a new IOException so that we get the caller's stack trace as well.
             throw new IOException2("remote file operation failed",e);
@@ -853,9 +1009,9 @@ public final class FilePath implements Serializable {
         return n.substring(0,idx);
     }
     /**
-     * Gets just the file name portion.
+     * Gets just the file name portion without directories.
      *
-     * This method assumes that the file name is the same between local and remote.
+     * For example, "foo.txt" for "../abc/foo.txt"
      */
     public String getName() {
         String r = remote;
@@ -889,11 +1045,11 @@ public final class FilePath implements Serializable {
 
     /**
      * The same as {@link FilePath#FilePath(FilePath,String)} but more OO.
-     * @param rel a relative or absolute path
+     * @param relOrAbsolute a relative or absolute path
      * @return a file on the same channel
      */
-    public FilePath child(String rel) {
-        return new FilePath(this,rel);
+    public FilePath child(String relOrAbsolute) {
+        return new FilePath(this,relOrAbsolute);
     }
 
     /**
@@ -913,6 +1069,16 @@ public final class FilePath implements Serializable {
 
     /**
      * Creates a temporary file in the directory that this {@link FilePath} object designates.
+     *
+     * @param prefix
+     *      The prefix string to be used in generating the file's name; must be
+     *      at least three characters long
+     * @param suffix
+     *      The suffix string to be used in generating the file's name; may be
+     *      null, in which case the suffix ".tmp" will be used
+     * @return
+     *      The new FilePath pointing to the temporary file
+     * @see File#createTempFile(String, String)
      */
     public FilePath createTempFile(final String prefix, final String suffix) throws IOException, InterruptedException {
         try {
@@ -928,16 +1094,46 @@ public final class FilePath implements Serializable {
     }
 
     /**
-     * Creates a temporary file in this directory and set the contents by the
+     * Creates a temporary file in this directory and set the contents to the
      * given text (encoded in the platform default encoding)
+     *
+     * @param prefix
+     *      The prefix string to be used in generating the file's name; must be
+     *      at least three characters long
+     * @param suffix
+     *      The suffix string to be used in generating the file's name; may be
+     *      null, in which case the suffix ".tmp" will be used
+     * @param contents
+     *      The initial contents of the temporary file.
+     * @return
+     *      The new FilePath pointing to the temporary file
+     * @see File#createTempFile(String, String)
      */
     public FilePath createTextTempFile(final String prefix, final String suffix, final String contents) throws IOException, InterruptedException {
         return createTextTempFile(prefix,suffix,contents,true);
     }
 
     /**
-     * Creates a temporary file in this directory and set the contents by the
-     * given text (encoded in the platform default encoding)
+     * Creates a temporary file in this directory (or the system temporary
+     * directory) and set the contents to the given text (encoded in the
+     * platform default encoding)
+     *
+     * @param prefix
+     *      The prefix string to be used in generating the file's name; must be
+     *      at least three characters long
+     * @param suffix
+     *      The suffix string to be used in generating the file's name; may be
+     *      null, in which case the suffix ".tmp" will be used
+     * @param contents
+     *      The initial contents of the temporary file.
+     * @param inThisDirectory
+     *      If true, then create this temporary in the directory pointed to by
+     *      this.
+     *      If false, then the temporary file is created in the system temporary
+     *      directory (java.io.tmpdir)
+     * @return
+     *      The new FilePath pointing to the temporary file
+     * @see File#createTempFile(String, String)
      */
     public FilePath createTextTempFile(final String prefix, final String suffix, final String contents, final boolean inThisDirectory) throws IOException, InterruptedException {
         try {
@@ -969,7 +1165,17 @@ public final class FilePath implements Serializable {
 
     /**
      * Creates a temporary directory inside the directory represented by 'this'
+     *
+     * @param prefix
+     *      The prefix string to be used in generating the directory's name;
+     *      must be at least three characters long
+     * @param suffix
+     *      The suffix string to be used in generating the directory's name; may
+     *      be null, in which case the suffix ".tmp" will be used
+     * @return
+     *      The new FilePath pointing to the temporary directory
      * @since 1.311
+     * @see File#createTempFile(String, String)
      */
     public FilePath createTempDir(final String prefix, final String suffix) throws IOException, InterruptedException {
         try {
@@ -1034,6 +1240,7 @@ public final class FilePath implements Serializable {
      */
     public void touch(final long timestamp) throws IOException, InterruptedException {
         act(new FileCallable<Void>() {
+            private static final long serialVersionUID = -5094638816500738429L;
             public Void invoke(File f, VirtualChannel channel) throws IOException {
                 if(!f.exists())
                     new FileOutputStream(f).close();
@@ -1042,6 +1249,28 @@ public final class FilePath implements Serializable {
                 return null;
             }
         });
+    }
+    
+    private void setLastModifiedIfPossible(final long timestamp) throws IOException, InterruptedException {
+        String message = act(new FileCallable<String>() {
+            private static final long serialVersionUID = -828220335793641630L;
+            public String invoke(File f, VirtualChannel channel) throws IOException {
+                if(!f.setLastModified(timestamp)) {
+                    if (Functions.isWindows()) {
+                        // On Windows this seems to fail often. See JENKINS-11073
+                        // Therefore don't fail, but just log a warning
+                        return "Failed to set the timestamp of "+f+" to "+timestamp;
+                    } else {
+                        throw new IOException("Failed to set the timestamp of "+f+" to "+timestamp);
+                    }
+                }
+                return null;
+            }
+        });
+
+        if (message!=null) {
+            LOGGER.warning(message);
+        }
     }
 
     /**
@@ -1076,6 +1305,10 @@ public final class FilePath implements Serializable {
      * @param mask
      *      File permission mask. To simplify the permission copying,
      *      if the parameter is -1, this method becomes no-op.
+     *      <p>
+     *      please note mask is expected to be an octal if you use <a href="http://en.wikipedia.org/wiki/Chmod">chmod command line values</a>,
+     *      so preceded by a '0' in java notation, ie <code>chmod(0644)</code>
+     *
      * @since 1.303
      * @see #mode()
      */
@@ -1214,9 +1447,24 @@ public final class FilePath implements Serializable {
      * @since 1.407
      */
     public FilePath[] list(final String includes, final String excludes) throws IOException, InterruptedException {
+        return list(includes, excludes, true);
+    }
+
+    /**
+     * List up files in this directory that matches the given Ant-style filter.
+     *
+     * @param includes
+     * @param excludes
+     *      See {@link FileSet} for the syntax. String like "foo/*.zip" or "foo/*&#42;/*.xml"
+     * @param defaultExcludes whether to use the ant default excludes
+     * @return
+     *      can be empty but always non-null.
+     * @since 1.465
+     */
+    public FilePath[] list(final String includes, final String excludes, final boolean defaultExcludes) throws IOException, InterruptedException {
         return act(new FileCallable<FilePath[]>() {
             public FilePath[] invoke(File f, VirtualChannel channel) throws IOException {
-                String[] files = glob(f,includes,excludes);
+                String[] files = glob(f, includes, excludes, defaultExcludes);
 
                 FilePath[] r = new FilePath[files.length];
                 for( int i=0; i<r.length; i++ )
@@ -1233,10 +1481,11 @@ public final class FilePath implements Serializable {
      * @return
      *      A set of relative file names from the base directory.
      */
-    private static String[] glob(File dir, String includes, String excludes) throws IOException {
+    private static String[] glob(File dir, String includes, String excludes, boolean defaultExcludes) throws IOException {
         if(isAbsolute(includes))
             throw new IOException("Expecting Ant GLOB pattern, but saw '"+includes+"'. See http://ant.apache.org/manual/Types/fileset.html for syntax");
         FileSet fs = Util.createFileSet(dir,includes,excludes);
+        fs.setDefaultexcludes(defaultExcludes);
         DirectoryScanner ds = fs.getDirectoryScanner(new Project());
         String[] files = ds.getIncludedFiles();
         return files;
@@ -1283,6 +1532,16 @@ public final class FilePath implements Serializable {
      * Writes to this file.
      * If this file already exists, it will be overwritten.
      * If the directory doesn't exist, it will be created.
+     *
+     * <P>
+     * I/O operation to remote {@link FilePath} happens asynchronously, meaning write operations to the returned
+     * {@link OutputStream} will return without receiving a confirmation from the remote that the write happened.
+     * I/O operations also happens asynchronously from the {@link Channel#call(Callable)} operations, so if
+     * you write to a remote file and then execute {@link Channel#call(Callable)} and try to access the newly copied
+     * file, it might not be fully written yet.
+     *
+     * <p>
+     *
      */
     public OutputStream write() throws IOException, InterruptedException {
         if(channel==null) {
@@ -1392,13 +1651,14 @@ public final class FilePath implements Serializable {
     }
 
     /**
-     * Copies this file to the specified target, with file permissions intact.
+     * Copies this file to the specified target, with file permissions and other meta attributes intact.
      * @since 1.311
      */
     public void copyToWithPermission(FilePath target) throws IOException, InterruptedException {
         copyTo(target);
         // copy file permission
         target.chmod(mode());
+        target.setLastModifiedIfPossible(lastModified());
     }
 
     /**
@@ -1408,6 +1668,7 @@ public final class FilePath implements Serializable {
         final OutputStream out = new RemoteOutputStream(os);
 
         act(new FileCallable<Void>() {
+            private static final long serialVersionUID = 4088559042349254141L;
             public Void invoke(File f, VirtualChannel channel) throws IOException {
                 FileInputStream fis = null;
                 try {
@@ -1421,10 +1682,16 @@ public final class FilePath implements Serializable {
             }
         });
 
-        // make sure the write fully happens before we return.
+        // make sure the writes fully got delivered to 'os' before we return.
+        // this is needed because I/O operation is asynchronous
         syncIO();
     }
 
+    /**
+     * With fix to JENKINS-11251 (remoting 2.15), this is no longer necessary.
+     * But I'm keeping it for a while so that users who manually deploy slave.jar has time to deploy new version
+     * before this goes away.
+     */
     private void syncIO() throws InterruptedException {
         try {
             if (channel!=null)
@@ -1464,12 +1731,26 @@ public final class FilePath implements Serializable {
 
     /**
      * Copies the contents of this directory recursively into the specified target directory.
+     * 
+     * @return
+     *      the number of files copied.
      * @since 1.312 
      */
     public int copyRecursiveTo(FilePath target) throws IOException, InterruptedException {
         return copyRecursiveTo("**/*",target);
     }
 
+    /**
+     * Copies the files that match the given file mask to the specified target node.
+     *
+     * @param fileMask
+     *      Ant GLOB pattern.
+     *      String like "foo/bar/*.xml" Multiple patterns can be separated
+     *      by ',', and whitespace can surround ',' (so that you can write
+     *      "abc, def" and "abc,def" to mean the same thing.
+     * @return
+     *      the number of files copied.
+     */
     public int copyRecursiveTo(String fileMask, FilePath target) throws IOException, InterruptedException {
         return copyRecursiveTo(fileMask,null,target);
     }
@@ -1637,14 +1918,25 @@ public final class FilePath implements Serializable {
                     File parent = f.getParentFile();
                     if (parent != null) parent.mkdirs();
 
-                    IOUtils.copy(t,f);
-                    f.setLastModified(te.getModTime().getTime());
-                    int mode = te.getMode()&0777;
-                    if(mode!=0 && !Functions.isWindows()) // be defensive
-                        _chmod(f,mode);
+                    byte linkFlag = (Byte) LINKFLAG_FIELD.get(te);
+                    if (linkFlag==TarEntry.LF_SYMLINK) {
+                        new FilePath(f).symlinkTo(te.getLinkName(), TaskListener.NULL);
+                    } else {
+                        IOUtils.copy(t,f);
+
+                        f.setLastModified(te.getModTime().getTime());
+                        int mode = te.getMode()&0777;
+                        if(mode!=0 && !Functions.isWindows()) // be defensive
+                            _chmod(f,mode);
+                    }
                 }
             }
         } catch(IOException e) {
+            throw new IOException2("Failed to extract "+name,e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt(); // process this later
+            throw new IOException2("Failed to extract "+name,e);
+        } catch (IllegalAccessException e) {
             throw new IOException2("Failed to extract "+name,e);
         } finally {
             t.close();
@@ -1683,8 +1975,26 @@ public final class FilePath implements Serializable {
      * @see #validateFileMask(FilePath, String)
      */
     public String validateAntFileMask(final String fileMasks) throws IOException, InterruptedException {
+        return validateAntFileMask(fileMasks, Integer.MAX_VALUE);
+    }
+
+    /**
+     * Like {@link #validateAntFileMask(String)} but performing only a bounded number of operations.
+     * <p>Whereas the unbounded overload is appropriate for calling from cancelable, long-running tasks such as build steps,
+     * this overload should be used when an answer is needed quickly, such as for {@link #validateFileMask(String)}
+     * or anything else returning {@link FormValidation}.
+     * <p>If a positive match is found, {@code null} is returned immediately.
+     * A message is returned in case the file pattern can definitely be determined to not match anything in the directory within the alloted time.
+     * If the time runs out without finding a match but without ruling out the possibility that there might be one, {@link InterruptedException} is thrown,
+     * in which case the calling code should give the user the benefit of the doubt and use {@link hudson.util.FormValidation.Kind#OK} (with or without a message).
+     * @param bound a maximum number of negative operations (deliberately left vague) to perform before giving up on a precise answer; 10_000 is a reasonable pick
+     * @throws InterruptedException not only in case of a channel failure, but also if too many operations were performed without finding any matches
+     * @since 1.484
+     */
+    public String validateAntFileMask(final String fileMasks, final int bound) throws IOException, InterruptedException {
         return act(new FileCallable<String>() {
-            public String invoke(File dir, VirtualChannel channel) throws IOException {
+            private static final long serialVersionUID = 1;
+            public String invoke(File dir, VirtualChannel channel) throws IOException, InterruptedException {
                 if(fileMasks.startsWith("~"))
                     return Messages.FilePath_TildaDoesntWork();
 
@@ -1781,10 +2091,28 @@ public final class FilePath implements Serializable {
                 return null; // no error
             }
 
-            private boolean hasMatch(File dir, String pattern) {
-                FileSet fs = Util.createFileSet(dir,pattern);
-                DirectoryScanner ds = fs.getDirectoryScanner(new Project());
-
+            private boolean hasMatch(File dir, String pattern) throws InterruptedException {
+                class Cancel extends RuntimeException {}
+                DirectoryScanner ds = bound == Integer.MAX_VALUE ? new DirectoryScanner() : new DirectoryScanner() {
+                    int ticks;
+                    @Override public synchronized boolean isCaseSensitive() {
+                        if (!filesIncluded.isEmpty() || !dirsIncluded.isEmpty() || ticks++ > bound) {
+                            throw new Cancel();
+                        }
+                        return super.isCaseSensitive();
+                    }
+                };
+                ds.setBasedir(dir);
+                ds.setIncludes(new String[] {pattern});
+                try {
+                    ds.scan();
+                } catch (Cancel c) {
+                    if (ds.getIncludedFilesCount()!=0 || ds.getIncludedDirsCount()!=0) {
+                        return true;
+                    } else {
+                        throw new InterruptedException("no matches found within " + bound);
+                    }
+                }
                 return ds.getIncludedFilesCount()!=0 || ds.getIncludedDirsCount()!=0;
             }
 
@@ -1833,11 +2161,11 @@ public final class FilePath implements Serializable {
             if(!exists()) // no workspace. can't check
                 return FormValidation.ok();
 
-            String msg = validateAntFileMask(value);
+            String msg = validateAntFileMask(value, 10000);
             if(errorIfNotExist)     return FormValidation.error(msg);
             else                    return FormValidation.warning(msg);
         } catch (InterruptedException e) {
-            return FormValidation.ok();
+            return FormValidation.ok(Messages.FilePath_did_not_manage_to_validate_may_be_too_sl(value));
         }
     }
 
@@ -1896,7 +2224,7 @@ public final class FilePath implements Serializable {
     private static void checkPermissionForValidate() {
         AccessControlled subject = Stapler.getCurrentRequest().findAncestorObject(AbstractProject.class);
         if (subject == null)
-            Hudson.getInstance().checkPermission(Hudson.ADMINISTER);
+            Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);
         else
             subject.checkPermission(Item.CONFIGURE);
     }
@@ -1920,7 +2248,7 @@ public final class FilePath implements Serializable {
 
     public VirtualChannel getChannel() {
         if(channel!=null)   return channel;
-        else                return Hudson.MasterComputer.localChannel;
+        else                return Jenkins.MasterComputer.localChannel;
     }
 
     /**
@@ -2005,4 +2333,18 @@ public final class FilePath implements Serializable {
             return o1.length()-o2.length();
         }
     };
+
+    private static final Field LINKFLAG_FIELD = getTarEntryLinkFlagField();
+
+    private static Field getTarEntryLinkFlagField() {
+        try {
+            Field f = TarEntry.class.getDeclaredField("linkFlag");
+            f.setAccessible(true);
+            return f;
+        } catch (SecurityException e) {
+            throw new AssertionError(e);
+        } catch (NoSuchFieldException e) {
+            throw new AssertionError(e);
+        }
+    }
 }

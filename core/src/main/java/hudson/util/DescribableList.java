@@ -39,7 +39,6 @@ import hudson.model.Descriptor.FormException;
 import hudson.model.ReconfigurableDescribable;
 import hudson.model.Saveable;
 import net.sf.json.JSONObject;
-import org.apache.avalon.framework.configuration.Reconfigurable;
 import org.kohsuke.stapler.StaplerRequest;
 
 import java.io.IOException;
@@ -98,6 +97,25 @@ public class DescribableList<T extends Describable<T>, D extends Descriptor<T>> 
         removeAll((Class)item.getClass());
         data.add(item);
         onModified();
+    }
+
+    /**
+     * Binds items in the collection to URL.
+     */
+    public T getDynamic(String id) {
+        // by ID
+        for (T t : data)
+            if(t.getDescriptor().getId().equals(id))
+                return t;
+
+        // by position
+        try {
+            return data.get(Integer.parseInt(id));
+        } catch (NumberFormatException e) {
+            // fall through
+        }
+
+        return null;
     }
 
     public T get(D descriptor) {

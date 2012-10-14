@@ -27,15 +27,17 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
-import hudson.console.HyperlinkNote;
+import hudson.console.ModelHyperlinkNote;
 import hudson.diagnosis.OldDataMonitor;
 import hudson.util.XStream2;
+import jenkins.model.Jenkins;
 import org.kohsuke.stapler.export.Exported;
 import org.kohsuke.stapler.export.ExportedBean;
 import com.thoughtworks.xstream.converters.UnmarshallingContext;
+import javax.annotation.Nonnull;
 
 /**
- * Cause object base class.  This class hierarchy is used to keep track of why 
+ * Cause object base class.  This class hierarchy is used to keep track of why
  * a given build was started. This object encapsulates the UI rendering of the cause,
  * as well as providing more useful information in respective subypes.
  *
@@ -88,17 +90,22 @@ public abstract class Cause {
         public LegacyCodeCause() {
             stackTrace = new Exception().getStackTrace();
         }
-        
+
         @Override
         public String getShortDescription() {
             return Messages.Cause_LegacyCodeCause_ShortDescription();
         }
     }
-    
+
     /**
      * A build is triggered by the completion of another build (AKA upstream build.)
      */
     public static class UpstreamCause extends Cause {
+
+        /**
+         * Maximum depth of transitive upstream causes we want to record.
+         */
+        private static final int MAX_DEPTH = 10;
         private String upstreamProject, upstreamUrl;
         private int upstreamBuild;
         /**
@@ -106,7 +113,7 @@ public abstract class Cause {
          */
         @Deprecated
         private transient Cause upstreamCause;
-        private List<Cause> upstreamCauses;
+        private @Nonnull List<Cause> upstreamCauses;
 
         /**
          * @deprecated since 2009-02-28
@@ -115,12 +122,38 @@ public abstract class Cause {
         public UpstreamCause(AbstractBuild<?,?> up) {
             this((Run<?,?>)up);
         }
-        
+
         public UpstreamCause(Run<?, ?> up) {
             upstreamBuild = up.getNumber();
             upstreamProject = up.getParent().getFullName();
             upstreamUrl = up.getParent().getUrl();
-            upstreamCauses = new ArrayList<Cause>(up.getCauses());
+            upstreamCauses = new ArrayList<Cause>();
+            for (Cause c : up.getCauses()) {
+                upstreamCauses.add(trim(c, MAX_DEPTH));
+            }
+        }
+
+        private UpstreamCause(String upstreamProject, int upstreamBuild, String upstreamUrl, @Nonnull List<Cause> upstreamCauses) {
+            this.upstreamProject = upstreamProject;
+            this.upstreamBuild = upstreamBuild;
+            this.upstreamUrl = upstreamUrl;
+            this.upstreamCauses = upstreamCauses;
+        }
+
+        private @Nonnull Cause trim(@Nonnull Cause c, int depth) {
+            if (!(c instanceof UpstreamCause)) {
+                return c;
+            }
+            UpstreamCause uc = (UpstreamCause) c;
+            List<Cause> cs = new ArrayList<Cause>();
+            if (depth > 0) {
+                for (Cause c2 : uc.upstreamCauses) {
+                    cs.add(trim(c2, depth - 1));
+                }
+            } else {
+                cs.add(new DeeplyNestedUpstreamCause());
+            }
+            return new UpstreamCause(uc.upstreamProject, uc.upstreamBuild, uc.upstreamUrl, cs);
         }
 
         /**
@@ -151,6 +184,10 @@ public abstract class Cause {
         public String getUpstreamUrl() {
             return upstreamUrl;
         }
+
+        public List<Cause> getUpstreamCauses() {
+            return upstreamCauses;
+        }
         
         @Override
         public String getShortDescription() {
@@ -161,9 +198,19 @@ public abstract class Cause {
         public void print(TaskListener listener) {
             listener.getLogger().println(
                 Messages.Cause_UpstreamCause_ShortDescription(
-                    HyperlinkNote.encodeTo('/'+upstreamUrl, upstreamProject),
-                    HyperlinkNote.encodeTo('/'+upstreamUrl+upstreamBuild, Integer.toString(upstreamBuild)))
+                    ModelHyperlinkNote.encodeTo('/' + upstreamUrl, upstreamProject),
+                    ModelHyperlinkNote.encodeTo('/'+upstreamUrl+upstreamBuild, Integer.toString(upstreamBuild)))
             );
+            if(upstreamCauses != null && upstreamCauses.size() > 0) {
+                listener.getLogger().println(Messages.Cause_UpstreamCause_CausedBy());
+                for (Cause cause : upstreamCauses) {
+                    cause.print(listener);
+                }
+            }
+        }
+
+        @Override public String toString() {
+            return upstreamUrl + upstreamBuild + upstreamCauses;
         }
 
         public static class ConverterImpl extends XStream2.PassthruConverter<UpstreamCause> {
@@ -177,15 +224,28 @@ public abstract class Cause {
                 }
             }
         }
+
+        public static class DeeplyNestedUpstreamCause extends Cause {
+            @Override public String getShortDescription() {
+                return "(deeply nested causes)";
+            }
+            @Override public String toString() {
+                return "JENKINS-14814";
+            }
+        }
+
     }
 
     /**
      * A build is started by an user action.
+     *
+     * @deprecated 1.428
+     *   use {@link UserIdCause}
      */
     public static class UserCause extends Cause {
         private String authenticationName;
         public UserCause() {
-            this.authenticationName = Hudson.getAuthentication().getName();
+            this.authenticationName = Jenkins.getAuthentication().getName();
         }
 
         @Exported(visibility=3)
@@ -208,6 +268,59 @@ public abstract class Cause {
         @Override
         public int hashCode() {
             return 295 + (this.authenticationName != null ? this.authenticationName.hashCode() : 0);
+        }
+    }
+
+    /**
+     * A build is started by an user action.
+     *
+     * @since 1.427
+     */
+    public static class UserIdCause extends Cause {
+
+        private String userId;
+
+        public UserIdCause() {
+            User user = User.current();
+            this.userId = (user == null) ? null : user.getId();
+        }
+
+        @Exported(visibility = 3)
+        public String getUserId() {
+            return userId;
+        }
+
+        @Exported(visibility = 3)
+        public String getUserName() {
+            String userName = "anonymous";
+            if (userId != null) {
+                User user = User.get(userId, false);
+                if (user != null)
+                    userName = user.getDisplayName();
+            }
+            return userName;
+        }
+
+        @Override
+        public String getShortDescription() {
+            return Messages.Cause_UserIdCause_ShortDescription(getUserName());
+        }
+
+        @Override
+        public void print(TaskListener listener) {
+            listener.getLogger().println(Messages.Cause_UserIdCause_ShortDescription(
+                    ModelHyperlinkNote.encodeTo("/user/"+getUserId(), getUserName())));
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof UserIdCause && Arrays.equals(new Object[]{userId},
+                    new Object[]{((UserIdCause) o).userId});
+        }
+
+        @Override
+        public int hashCode() {
+            return 295 + (this.userId != null ? this.userId.hashCode() : 0);
         }
     }
 
