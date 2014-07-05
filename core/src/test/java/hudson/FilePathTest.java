@@ -25,15 +25,26 @@ package hudson;
 
 import hudson.FilePath.TarCompression;
 import hudson.model.TaskListener;
-import hudson.remoting.LocalChannel;
 import hudson.remoting.VirtualChannel;
-import hudson.util.IOException2;
 import hudson.util.NullStream;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.output.NullOutputStream;
+import org.apache.tools.ant.Project;
+import org.apache.tools.ant.taskdefs.Chmod;
+import org.jvnet.hudson.test.Bug;
+import org.mockito.Mockito;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLConnection;
+import java.net.URLStreamHandler;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -43,12 +54,10 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
-import org.apache.commons.io.FileUtils;
-import org.apache.commons.io.output.NullOutputStream;
-import org.apache.tools.ant.Project;
-import org.apache.tools.ant.taskdefs.Chmod;
-import org.jvnet.hudson.test.Bug;
+import static org.mockito.Mockito.*;
 
 /**
  * @author Kohsuke Kawaguchi
@@ -132,9 +141,9 @@ public class FilePathTest extends ChannelTestCase {
                         private Exception closed;
                         private volatile int count;
 
-                        private void checkNotClosed() throws IOException2 {
+                        private void checkNotClosed() throws IOException {
                             if (closed != null)
-                                throw new IOException2(closed);
+                                throw new IOException(closed);
                         }
 
                         @Override
@@ -191,6 +200,46 @@ public class FilePathTest extends ChannelTestCase {
             assertEquals(1, fp.copyRecursiveTo(new FilePath(dst)));
             // copy again should still report 1
             assertEquals(1, fp.copyRecursiveTo(new FilePath(dst)));
+        } finally {
+            Util.deleteRecursive(tmp);
+        }
+    }
+
+    @Bug(9540)
+    public void testErrorMessageInRemoteCopyRecursive() throws Exception {
+        File tmp = Util.createTempDir();
+        try {
+            File src = new File(tmp, "src");
+            File dst = new File(tmp, "dst");
+            FilePath from = new FilePath(src);
+            FilePath to = new FilePath(british, dst.getAbsolutePath());
+            for (int i = 0; i < 10000; i++) {
+                // TODO is there a simpler way to force the TarOutputStream to be flushed and the reader to start?
+                // Have not found a way to make the failure guaranteed.
+                OutputStream os = from.child("content" + i).write();
+                try {
+                    for (int j = 0; j < 1024; j++) {
+                        os.write('.');
+                    }
+                } finally {
+                    os.close();
+                }
+            }
+            FilePath toF = to.child("content0");
+            toF.write().close();
+            toF.chmod(0400);
+            try {
+                from.copyRecursiveTo(to);
+                // on Windows this may just succeed; OK, test did not prove anything then
+            } catch (IOException x) {
+                if (Functions.printThrowable(x).contains("content0")) {
+                    // Fine, error message talks about permission denied.
+                } else {
+                    throw x;
+                }
+            } finally {
+                toF.chmod(700);
+            }
         } finally {
             Util.deleteRecursive(tmp);
         }
@@ -336,18 +385,19 @@ public class FilePathTest extends ChannelTestCase {
 
     @Bug(11073)
     public void testIsUnix() {
-        FilePath winPath = new FilePath(new LocalChannel(null),
+        VirtualChannel dummy = Mockito.mock(VirtualChannel.class);
+        FilePath winPath = new FilePath(dummy,
                 " c:\\app\\hudson\\workspace\\3.8-jelly-db\\jdk/jdk1.6.0_21/label/sqlserver/profile/sqlserver\\acceptance-tests\\distribution.zip");
         assertFalse(winPath.isUnix());
 
-        FilePath base = new FilePath(new LocalChannel(null),
+        FilePath base = new FilePath(dummy,
                 "c:\\app\\hudson\\workspace\\3.8-jelly-db");
         FilePath middle = new FilePath(base, "jdk/jdk1.6.0_21/label/sqlserver/profile/sqlserver");
         FilePath full = new FilePath(middle, "acceptance-tests\\distribution.zip");
         assertFalse(full.isUnix());
         
         
-        FilePath unixPath = new FilePath(new LocalChannel(null),
+        FilePath unixPath = new FilePath(dummy,
                 "/home/test");
         assertTrue(unixPath.isUnix());
     }
@@ -414,8 +464,9 @@ public class FilePathTest extends ChannelTestCase {
 
     @Bug(13649)
     public void testMultiSegmentRelativePaths() throws Exception {
-        FilePath winPath = new FilePath(new LocalChannel(null), "c:\\app\\jenkins\\workspace");
-        FilePath nixPath = new FilePath(new LocalChannel(null), "/opt/jenkins/workspace");
+        VirtualChannel d = Mockito.mock(VirtualChannel.class);
+        FilePath winPath = new FilePath(d, "c:\\app\\jenkins\\workspace");
+        FilePath nixPath = new FilePath(d, "/opt/jenkins/workspace");
 
         assertEquals("c:\\app\\jenkins\\workspace\\foo\\bar\\manchu", new FilePath(winPath, "foo/bar/manchu").getRemote());
         assertEquals("c:\\app\\jenkins\\workspace\\foo\\bar\\manchu", new FilePath(winPath, "foo\\bar/manchu").getRemote());
@@ -439,7 +490,7 @@ public class FilePathTest extends ChannelTestCase {
             assertValidateAntFileMask(Messages.FilePath_validateAntFileMask_portionMatchButPreviousNotMatchAndSuggest("**/*.js", "**", "**/*.js"), d, "**/*.js");
             assertValidateAntFileMask(Messages.FilePath_validateAntFileMask_doesntMatchAnything("index.htm"), d, "index.htm");
             assertValidateAntFileMask(Messages.FilePath_validateAntFileMask_doesntMatchAndSuggest("f.html", "d1/d2/d3/f.html"), d, "f.html");
-            // XXX lots more to test, e.g. multiple patterns separated by commas; ought to have full code coverage for this method
+            // TODO lots more to test, e.g. multiple patterns separated by commas; ought to have full code coverage for this method
         } finally {
             Util.deleteRecursive(tmp);
         }
@@ -474,5 +525,126 @@ public class FilePathTest extends ChannelTestCase {
             Util.deleteRecursive(tmp);
         }
     }
+   
+    @Bug(15418)
+    public void testDeleteLongPathOnWindows() throws Exception {
+        File tmp = Util.createTempDir();
+        try {
+            FilePath d = new FilePath(french, tmp.getPath());
+            
+            // construct a very long path
+            StringBuilder sb = new StringBuilder();
+            while(sb.length() + tmp.getPath().length() < 260 - "very/".length()) {
+                sb.append("very/");
+            }
+            sb.append("pivot/very/very/long/path");
+            
+            FilePath longPath = d.child(sb.toString()); 
+            longPath.mkdirs();
+            FilePath childInLongPath = longPath.child("file.txt");
+            childInLongPath.touch(0);
+            
+            File firstDirectory = new File(tmp.getAbsolutePath() + "/very");
+            Util.deleteRecursive(firstDirectory);
+            
+            assertFalse("Could not delete directory!", firstDirectory.exists());
+            
+        } finally {
+            Util.deleteRecursive(tmp);
+        }
+    }
 
+    @Bug(16215)
+    public void testInstallIfNecessaryAvoidsExcessiveDownloadsByUsingIfModifiedSince() throws Exception {
+        final File tmp = Util.createTempDir();
+        try {
+            final FilePath d = new FilePath(tmp);
+
+            d.child(".timestamp").touch(123000);
+
+            final HttpURLConnection con = mock(HttpURLConnection.class);
+            final URL url = someUrlToZipFile(con);
+
+            when(con.getResponseCode())
+                .thenReturn(HttpURLConnection.HTTP_NOT_MODIFIED);
+
+            assertFalse(d.installIfNecessaryFrom(url, null, null));
+
+            verify(con).setIfModifiedSince(123000);
+        } finally {
+            Util.deleteRecursive(tmp);
+        }
+    }
+
+    @Bug(16215)
+    public void testInstallIfNecessaryPerformsInstallation() throws Exception {
+        final File tmp = Util.createTempDir();
+        try {
+            final FilePath d = new FilePath(tmp);
+
+            final HttpURLConnection con = mock(HttpURLConnection.class);
+            final URL url = someUrlToZipFile(con);
+
+            when(con.getResponseCode())
+              .thenReturn(HttpURLConnection.HTTP_OK);
+
+            when(con.getInputStream())
+              .thenReturn(someZippedContent());
+
+            assertTrue(d.installIfNecessaryFrom(url, null, null));
+        } finally {
+          Util.deleteRecursive(tmp);
+        }
+    }
+
+    private URL someUrlToZipFile(final URLConnection con) throws IOException {
+
+        final URLStreamHandler urlHandler = new URLStreamHandler() {
+            @Override protected URLConnection openConnection(URL u) throws IOException {
+                return con;
+            }
+        };
+
+        return new URL("http", "some-host", 0, "/some-path.zip", urlHandler);
+    }
+
+    private InputStream someZippedContent() throws IOException {
+        final ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        final ZipOutputStream zip = new ZipOutputStream(buf);
+
+        zip.putNextEntry(new ZipEntry("abc"));
+        zip.write("abc".getBytes());
+        zip.close();
+
+        return new ByteArrayInputStream(buf.toByteArray());
+    }
+
+    @Bug(16846)
+    public void testMoveAllChildrenTo() throws IOException, InterruptedException {
+        final File tmp = Util.createTempDir();
+        try
+        {
+            final String dirname = "sub";
+            final File top = new File(tmp, "test");
+            final File sub = new File(top, dirname);
+            final File subsub = new File(sub, dirname);
+
+            subsub.mkdirs();
+
+            final File subFile1 = new File( sub.getAbsolutePath() + "/file1.txt" );
+            subFile1.createNewFile();
+            final File subFile2 = new File( subsub.getAbsolutePath() + "/file2.txt" );
+            subFile2.createNewFile();
+
+            final FilePath src = new FilePath(sub);
+            final FilePath dst = new FilePath(top);
+            
+            // test conflict subdir
+            src.moveAllChildrenTo(dst);
+        }
+        finally
+        {
+          Util.deleteRecursive(tmp);
+        }
+    }
 }

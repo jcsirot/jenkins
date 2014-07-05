@@ -45,6 +45,7 @@ import java.util.jar.Manifest;
 import java.util.logging.Logger;
 import static java.util.logging.Level.WARNING;
 
+import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.LogFactory;
 import org.kohsuke.stapler.HttpResponse;
 import org.kohsuke.stapler.HttpResponses;
@@ -54,6 +55,8 @@ import org.kohsuke.stapler.interceptor.RequirePOST;
 
 import java.util.Enumeration;
 import java.util.jar.JarFile;
+import java.util.logging.Level;
+import javax.annotation.CheckForNull;
 
 /**
  * Represents a Jenkins plug-in and associated control information
@@ -211,7 +214,7 @@ public class PluginWrapper implements Comparable<PluginWrapper>, ModelObject {
     }
 
     public String getDisplayName() {
-        return getLongName();
+        return StringUtils.removeStart(getLongName(), "Jenkins ");
     }
 
     public Api getApi() {
@@ -235,7 +238,7 @@ public class PluginWrapper implements Comparable<PluginWrapper>, ModelObject {
         return idx != null && idx.toString().contains(shortName) ? idx : null;
     }
 
-    private String computeShortName(Manifest manifest, File archive) {
+    static String computeShortName(Manifest manifest, File archive) {
         // use the name captured in the manifest, as often plugins
         // depend on the specific short name in its URLs.
         String n = manifest.getMainAttributes().getValue("Short-Name");
@@ -283,8 +286,9 @@ public class PluginWrapper implements Comparable<PluginWrapper>, ModelObject {
     /**
      * Gets the instance of {@link Plugin} contributed by this plugin.
      */
-    public Plugin getPlugin() {
-        return Jenkins.lookup(PluginInstanceStore.class).store.get(this);
+    public @CheckForNull Plugin getPlugin() {
+        PluginInstanceStore pis = Jenkins.lookup(PluginInstanceStore.class);
+        return pis != null ? pis.store.get(this) : null;
     }
 
     /**
@@ -372,11 +376,16 @@ public class PluginWrapper implements Comparable<PluginWrapper>, ModelObject {
      * Terminates the plugin.
      */
     public void stop() {
-        LOGGER.info("Stopping "+shortName);
-        try {
-            getPlugin().stop();
-        } catch(Throwable t) {
-            LOGGER.log(WARNING, "Failed to shut down "+shortName, t);
+        Plugin plugin = getPlugin();
+        if (plugin != null) {
+            try {
+                LOGGER.log(Level.FINE, "Stopping {0}", shortName);
+                plugin.stop();
+            } catch (Throwable t) {
+                LOGGER.log(WARNING, "Failed to shut down " + shortName, t);
+            }
+        } else {
+            LOGGER.log(Level.FINE, "Could not find Plugin instance to stop for {0}", shortName);
         }
         // Work around a bug in commons-logging.
         // See http://www.szegedi.org/articles/memleak.html
@@ -487,7 +496,7 @@ public class PluginWrapper implements Comparable<PluginWrapper>, ModelObject {
 
     /**
      * If the plugin has {@link #getUpdateInfo() an update},
-     * returns the {@link UpdateSite.Plugin} object.
+     * returns the {@link hudson.model.UpdateSite.Plugin} object.
      *
      * @return
      *      This method may return null &mdash; for example,
@@ -501,7 +510,7 @@ public class PluginWrapper implements Comparable<PluginWrapper>, ModelObject {
     }
     
     /**
-     * returns the {@link UpdateSite.Plugin} object, or null.
+     * returns the {@link hudson.model.UpdateSite.Plugin} object, or null.
      */
     public UpdateSite.Plugin getInfo() {
         UpdateCenter uc = Jenkins.getInstance().getUpdateCenter();
@@ -567,9 +576,13 @@ public class PluginWrapper implements Comparable<PluginWrapper>, ModelObject {
         if (backup.exists()) {
             try {
                 JarFile backupPlugin = new JarFile(backup);
-                return backupPlugin.getManifest().getMainAttributes().getValue("Plugin-Version");
+                try {
+                    return backupPlugin.getManifest().getMainAttributes().getValue("Plugin-Version");
+                } finally {
+                    backupPlugin.close();
+                }
             } catch (IOException e) {
-                LOGGER.log(WARNING, "Failed to get backup version ", e);
+                LOGGER.log(WARNING, "Failed to get backup version from " + backup, e);
                 return null;
             }
         } else {

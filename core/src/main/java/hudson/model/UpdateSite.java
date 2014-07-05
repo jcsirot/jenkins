@@ -32,23 +32,14 @@ import hudson.model.UpdateCenter.UpdateCenterJob;
 import hudson.util.FormValidation;
 import hudson.util.FormValidation.Kind;
 import hudson.util.HttpResponses;
-import hudson.util.IOUtils;
 import hudson.util.TextFile;
+import static hudson.util.TimeUnit2.*;
 import hudson.util.VersionNumber;
-import jenkins.model.Jenkins;
-import jenkins.util.JSONSignatureValidator;
-import net.sf.json.JSONException;
-import net.sf.json.JSONObject;
-import org.kohsuke.stapler.DataBoundConstructor;
-import org.kohsuke.stapler.HttpResponse;
-import org.kohsuke.stapler.StaplerRequest;
-import org.kohsuke.stapler.export.Exported;
-import org.kohsuke.stapler.export.ExportedBean;
-import org.kohsuke.stapler.interceptor.RequirePOST;
-
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
+import java.net.URL;
+import java.net.URLEncoder;
 import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -57,12 +48,27 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-
-import static hudson.util.TimeUnit2.*;
-
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import jenkins.model.Jenkins;
+import jenkins.model.DownloadSettings;
+import jenkins.util.JSONSignatureValidator;
+import net.sf.json.JSONException;
+import net.sf.json.JSONObject;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang.StringUtils;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.stapler.interceptor.RequirePOST;
 
 /**
  * Source of the update center information, like "http://jenkins-ci.org/update-center.json"
@@ -79,18 +85,20 @@ import static hudson.util.TimeUnit2.*;
 public class UpdateSite {
     /**
      * What's the time stamp of data file?
+     * 0 means never.
      */
-    private transient long dataTimestamp = -1;
+    private transient volatile long dataTimestamp;
 
     /**
      * When was the last time we asked a browser to check the data for us?
+     * 0 means never.
      *
      * <p>
      * There's normally some delay between when we send HTML that includes the check code,
      * until we get the data back, so this variable is used to avoid asking too many browseres
      * all at once.
      */
-    private transient volatile long lastAttempt = -1;
+    private transient volatile long lastAttempt;
 
     /**
      * If the attempt to fetch data fails, we progressively use longer time out before retrying,
@@ -106,7 +114,7 @@ public class UpdateSite {
     /**
      * Latest data as read from the data file.
      */
-    private Data data;
+    private transient Data data;
 
     /**
      * ID string for this update source.
@@ -124,14 +132,6 @@ public class UpdateSite {
     }
 
     /**
-     * When read back from XML, initialize them back to -1.
-     */
-    private Object readResolve() {
-        dataTimestamp = lastAttempt = -1;
-        return this;
-    }
-
-    /**
      * Get ID string.
      */
     @Exported
@@ -141,25 +141,65 @@ public class UpdateSite {
 
     @Exported
     public long getDataTimestamp() {
+        assert dataTimestamp >= 0;
         return dataTimestamp;
     }
 
     /**
+     * Update the data file from the given URL if the file
+     * does not exist, or is otherwise due for update.
+     * Accepted formats are JSONP or HTML with {@code postMessage}, not raw JSON.
+     * @param signatureCheck whether to enforce the signature (may be off only for testing!)
+     * @return null if no updates are necessary, or the future result
+     * @since 1.502
+     */
+    public @CheckForNull Future<FormValidation> updateDirectly(final boolean signatureCheck) {
+        if (! getDataFile().exists() || isDue()) {
+            return Jenkins.getInstance().getUpdateCenter().updateService.submit(new Callable<FormValidation>() {
+                @Override public FormValidation call() throws Exception {
+                    return updateDirectlyNow(signatureCheck);
+                }
+            });
+        } else {
+            return null;
+        }
+    }
+
+    @Restricted(NoExternalUse.class)
+    public @Nonnull FormValidation updateDirectlyNow(boolean signatureCheck) throws IOException {
+        return updateData(DownloadService.loadJSON(new URL(getUrl() + "?id=" + URLEncoder.encode(getId(), "UTF-8") + "&version=" + URLEncoder.encode(Jenkins.VERSION, "UTF-8"))), signatureCheck);
+    }
+    
+    /**
      * This is the endpoint that receives the update center data file from the browser.
      */
     public FormValidation doPostBack(StaplerRequest req) throws IOException, GeneralSecurityException {
+        if (!DownloadSettings.get().isUseBrowser()) {
+            throw new IOException("not allowed");
+        }
+        return updateData(IOUtils.toString(req.getInputStream(),"UTF-8"), true);
+    }
+
+    private FormValidation updateData(String json, boolean signatureCheck)
+            throws IOException {
+
         dataTimestamp = System.currentTimeMillis();
-        String json = IOUtils.toString(req.getInputStream(),"UTF-8");
+
         JSONObject o = JSONObject.fromObject(json);
 
-        int v = o.getInt("updateCenterVersion");
-        if(v !=1)
-            throw new IllegalArgumentException("Unrecognized update center version: "+v);
+        try {
+            int v = o.getInt("updateCenterVersion");
+            if (v != 1) {
+                throw new IllegalArgumentException("Unrecognized update center version: " + v);
+            }
+        } catch (JSONException x) {
+            throw new IllegalArgumentException("Could not find (numeric) updateCenterVersion in " + json, x);
+        }
 
         if (signatureCheck) {
             FormValidation e = verifySignature(o);
             if (e.kind!=Kind.OK) {
-                LOGGER.severe(e.renderHtml());
+                LOGGER.severe(e.toString());
                 return e;
             }
         }
@@ -186,7 +226,7 @@ public class UpdateSite {
      */
     public boolean isDue() {
         if(neverUpdate)     return false;
-        if(dataTimestamp==-1)
+        if(dataTimestamp == 0)
             dataTimestamp = getDataFile().file.lastModified();
         long now = System.currentTimeMillis();
         
@@ -408,10 +448,10 @@ public class UpdateSite {
 
         Data(JSONObject o) {
             this.sourceId = (String)o.get("id");
-            if (sourceId.equals(UpdateCenter.ID_DEFAULT)) {
-                core = new Entry(sourceId, o.getJSONObject("core"), url);
-            }
-            else {
+            JSONObject c = o.optJSONObject("core");
+            if (c!=null) {
+                core = new Entry(sourceId, c, url);
+            } else {
                 core = null;
             }
             for(Map.Entry<String,JSONObject> e : (Set<Map.Entry<String,JSONObject>>)o.getJSONObject("plugins").entrySet()) {
@@ -545,6 +585,12 @@ public class UpdateSite {
         @Exported
         public final Map<String,String> dependencies = new HashMap<String,String>();
         
+        /**
+         * Optional dependencies of this plugin.
+         */
+        @Exported
+        public final Map<String,String> optionalDependencies = new HashMap<String,String>();
+
         @DataBoundConstructor
         public Plugin(String sourceId, JSONObject o) {
             super(sourceId, o, UpdateSite.this.url);
@@ -559,9 +605,12 @@ public class UpdateSite {
                 // Make sure there's a name attribute, that that name isn't maven-plugin - we ignore that one -
                 // and that the optional value isn't true.
                 if (get(depObj,"name")!=null
-                    && !get(depObj,"name").equals("maven-plugin")
-                    && get(depObj,"optional").equals("false")) {
-                    dependencies.put(get(depObj,"name"), get(depObj,"version"));
+                    && !get(depObj,"name").equals("maven-plugin")) {
+                    if (get(depObj, "optional").equals("false")) {
+                        dependencies.put(get(depObj, "name"), get(depObj, "version"));
+                    } else {
+                        optionalDependencies.put(get(depObj, "name"), get(depObj, "version"));
+                    }
                 }
                 
             }
@@ -576,8 +625,12 @@ public class UpdateSite {
         }
 
         public String getDisplayName() {
-            if(title!=null) return title;
-            return name;
+            String displayName;
+            if(title!=null)
+                displayName = title;
+            else
+                displayName = name;
+            return StringUtils.removeStart(displayName, "Jenkins ");
         }
 
         /**
@@ -639,6 +692,22 @@ public class UpdateSite {
                 }
             }
 
+            for(Map.Entry<String,String> e : optionalDependencies.entrySet()) {
+                Plugin depPlugin = Jenkins.getInstance().getUpdateCenter().getPlugin(e.getKey());
+                if (depPlugin == null) {
+                    continue;
+                }
+                VersionNumber requiredVersion = new VersionNumber(e.getValue());
+
+                PluginWrapper current = depPlugin.getInstalled();
+
+                // If the optional dependency plugin is installed, is the version we depend on newer than
+                // what's installed? If so, upgrade.
+                if (current != null && current.isOlderThan(requiredVersion)) {
+                    deps.add(depPlugin);
+                }
+            }
+
             return deps;
         }
         
@@ -649,6 +718,43 @@ public class UpdateSite {
             } catch (NumberFormatException nfe) {
                 return true;  // If unable to parse version
             }
+        }
+
+        public VersionNumber getNeededDependenciesRequiredCore() {
+            VersionNumber versionNumber = null;
+            try {
+                versionNumber = requiredCore == null ? null : new VersionNumber(requiredCore);
+            } catch (NumberFormatException nfe) {
+                // unable to parse version
+            }
+            for (Plugin p: getNeededDependencies()) {
+                VersionNumber v = p.getNeededDependenciesRequiredCore();
+                if (versionNumber == null || v.isNewerThan(versionNumber)) versionNumber = v;
+            }
+            return versionNumber;
+        }
+
+        public boolean isNeededDependenciesForNewerJenkins() {
+            for (Plugin p: getNeededDependencies()) {
+                if (p.isForNewerHudson() || p.isNeededDependenciesForNewerJenkins()) return true;
+            }
+            return false;
+        }
+
+        /**
+         * If at least some of the plugin's needed dependencies are already installed, and the new version of the
+         * needed dependencies plugin have a "compatibleSinceVersion"
+         * value (i.e., it's only directly compatible with that version or later), this will check to
+         * see if the installed version is older than the compatible-since version. If it is older, it'll return false.
+         * If it's not older, or it's not installed, or it's installed but there's no compatibleSinceVersion
+         * specified, it'll return true.
+         */
+        public boolean isNeededDependenciesCompatibleWithInstalledVersion() {
+            for (Plugin p: getNeededDependencies()) {
+                if (!p.isCompatibleWithInstalledVersion() || !p.isNeededDependenciesCompatibleWithInstalledVersion())
+                    return false;
+            }
+            return true;
         }
 
         /**
@@ -673,13 +779,19 @@ public class UpdateSite {
          * @param dynamicLoad
          *      If true, the plugin will be dynamically loaded into this Jenkins. If false,
          *      the plugin will only take effect after the reboot.
+         *      See {@link UpdateCenter#isRestartRequiredForCompletion()}
          */
         public Future<UpdateCenterJob> deploy(boolean dynamicLoad) {
             Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);
             UpdateCenter uc = Jenkins.getInstance().getUpdateCenter();
             for (Plugin dep : getNeededDependencies()) {
-                LOGGER.log(Level.WARNING, "Adding dependent install of " + dep.name + " for plugin " + name);
-                dep.deploy(dynamicLoad);
+                UpdateCenter.InstallationJob job = uc.getJob(dep);
+                if (job == null || job.status instanceof UpdateCenter.DownloadJob.Failure) {
+                    LOGGER.log(Level.WARNING, "Adding dependent install of " + dep.name + " for plugin " + name);
+                    dep.deploy(dynamicLoad);
+                } else {
+                    LOGGER.log(Level.WARNING, "Dependent install of " + dep.name + " for plugin " + name + " already added, skipping");
+                }
             }
             return uc.addJob(uc.new InstallationJob(this, UpdateSite.this, Jenkins.getAuthentication(), dynamicLoad));
         }
@@ -724,8 +836,4 @@ public class UpdateSite {
     // The name uses UpdateCenter for compatibility reason.
     public static boolean neverUpdate = Boolean.getBoolean(UpdateCenter.class.getName()+".never");
 
-    /**
-     * Off by default until we know this is reasonably working.
-     */
-    public static boolean signatureCheck = true; // Boolean.getBoolean(UpdateCenter.class.getName()+".signatureCheck");
 }

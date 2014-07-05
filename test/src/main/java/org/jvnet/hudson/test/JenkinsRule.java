@@ -27,9 +27,11 @@ package org.jvnet.hudson.test;
 import com.gargoylesoftware.htmlunit.AjaxController;
 import com.gargoylesoftware.htmlunit.BrowserVersion;
 import com.gargoylesoftware.htmlunit.DefaultCssErrorHandler;
+import com.gargoylesoftware.htmlunit.ElementNotFoundException;
 import com.gargoylesoftware.htmlunit.FailingHttpStatusCodeException;
 import com.gargoylesoftware.htmlunit.Page;
 import com.gargoylesoftware.htmlunit.WebRequestSettings;
+import com.gargoylesoftware.htmlunit.WebResponse;
 import com.gargoylesoftware.htmlunit.html.DomNode;
 import com.gargoylesoftware.htmlunit.html.HtmlButton;
 import com.gargoylesoftware.htmlunit.html.HtmlElement;
@@ -88,13 +90,10 @@ import hudson.model.TaskListener;
 import hudson.model.UpdateSite;
 import hudson.model.User;
 import hudson.model.View;
-import hudson.remoting.Channel;
-import hudson.remoting.VirtualChannel;
 import hudson.remoting.Which;
 import hudson.security.ACL;
 import hudson.security.AbstractPasswordBasedSecurityRealm;
 import hudson.security.GroupDetails;
-import hudson.security.SecurityRealm;
 import hudson.security.csrf.CrumbIssuer;
 import hudson.slaves.CommandLauncher;
 import hudson.slaves.ComputerConnector;
@@ -105,7 +104,6 @@ import hudson.tasks.Ant;
 import hudson.tasks.BuildWrapper;
 import hudson.tasks.BuildWrapperDescriptor;
 import hudson.tasks.Builder;
-import hudson.tasks.Mailer;
 import hudson.tasks.Maven;
 import hudson.tasks.Publisher;
 import hudson.tools.ToolProperty;
@@ -113,14 +111,64 @@ import hudson.util.PersistedList;
 import hudson.util.ReflectionUtils;
 import hudson.util.StreamTaskListener;
 import hudson.util.jna.GNUCLibrary;
+import java.beans.PropertyDescriptor;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.lang.annotation.Annotation;
+import java.lang.management.ThreadInfo;
+import java.lang.reflect.Array;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.net.HttpURLConnection;
+import java.net.MalformedURLException;
+import java.net.SocketTimeoutException;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.TreeSet;
+import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.jar.Manifest;
+import java.util.logging.Filter;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
+import javax.servlet.ServletContext;
+import javax.servlet.ServletContextEvent;
+
 import jenkins.model.Jenkins;
 import jenkins.model.JenkinsAdaptor;
+import jenkins.model.JenkinsLocationConfiguration;
 import net.sf.json.JSONObject;
 import net.sourceforge.htmlunit.corejs.javascript.Context;
 import net.sourceforge.htmlunit.corejs.javascript.ContextFactory;
 import org.acegisecurity.AuthenticationException;
 import org.acegisecurity.BadCredentialsException;
 import org.acegisecurity.GrantedAuthority;
+import org.acegisecurity.GrantedAuthorityImpl;
 import org.acegisecurity.userdetails.UserDetails;
 import org.acegisecurity.userdetails.UsernameNotFoundException;
 import org.apache.commons.beanutils.PropertyUtils;
@@ -128,9 +176,15 @@ import org.apache.commons.httpclient.NameValuePair;
 import org.apache.commons.io.FileUtils;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.artifact.resolver.AbstractArtifactResolutionException;
-import org.codehaus.plexus.component.repository.exception.ComponentLookupException;
 import org.hamcrest.Matchers;
+import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.junit.Assert.*;
+import org.junit.internal.AssumptionViolatedException;
+import static org.junit.matchers.JUnitMatchers.containsString;
 import org.junit.rules.MethodRule;
+import org.junit.rules.TemporaryFolder;
 import org.junit.rules.TestRule;
 import org.junit.runner.Description;
 import org.junit.runners.model.FrameworkMethod;
@@ -161,73 +215,25 @@ import org.w3c.css.sac.CSSParseException;
 import org.w3c.css.sac.ErrorHandler;
 import org.xml.sax.SAXException;
 
-import javax.servlet.ServletContext;
-import javax.servlet.ServletContextEvent;
-import java.beans.PropertyDescriptor;
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.lang.annotation.Annotation;
-import java.lang.management.ThreadInfo;
-import java.lang.reflect.Array;
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Field;
-import java.net.MalformedURLException;
-import java.net.URISyntaxException;
-import java.net.URL;
-import java.net.URLClassLoader;
-import java.nio.charset.Charset;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Enumeration;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Locale;
-import java.util.Timer;
-import java.util.TimerTask;
-import java.util.UUID;
-import java.util.concurrent.Callable;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import java.util.jar.Manifest;
-import java.util.logging.Filter;
-import java.util.logging.Level;
-import java.util.logging.LogRecord;
-import java.util.logging.Logger;
-
-import static org.hamcrest.Matchers.hasXPath;
-import static org.hamcrest.Matchers.is;
-import static org.hamcrest.Matchers.not;
-import static org.hamcrest.Matchers.notNullValue;
-import static org.junit.Assert.assertThat;
-import static org.junit.Assert.fail;
-import static org.junit.matchers.JUnitMatchers.containsString;
-
 /**
- * JUnit 4.10+ style rule to allow test cases to fire up a Jenkins instance
+ * JUnit rule to allow test cases to fire up a Jenkins instance.
  *
- * @see <a href="http://wiki.jenkins-ci.org/display/JENKINS/Unit+Test+JUnit4">Wiki article about unit testing in Jenkins</a>
+ * @see <a href="http://wiki.jenkins-ci.org/display/JENKINS/Unit+Test">Wiki article about unit testing in Jenkins</a>
  * @author Stephen Connolly
  * @since 1.436
+ * @see RestartableJenkinsRule
  */
+@SuppressWarnings({"deprecation","rawtypes"})
 public class JenkinsRule implements TestRule, MethodRule, RootAction {
 
-    private TestEnvironment env;
+    protected TestEnvironment env;
 
-    private Description testDescription;
-
-    private static JenkinsRule CURRENT = null;
+    protected Description testDescription;
 
     /**
      * Points to the same object as {@link #jenkins} does.
      */
+    @Deprecated
     public Hudson hudson;
 
     public Jenkins jenkins;
@@ -240,11 +246,12 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
     protected Server server;
 
     /**
-     * Where in the {@link Server} is Hudson deployed?
+     * Where in the {@link Server} is Jenkins deployed?
      * <p>
      * Just like {@link javax.servlet.ServletContext#getContextPath()}, starts with '/' but doesn't end with '/'.
+     * Unlike {@link WebClient#getContextPath} this is not a complete URL.
      */
-    protected String contextPath = "";
+    public String contextPath = "/jenkins";
 
     /**
      * {@link Runnable}s to be invoked at {@link #after()} .
@@ -257,11 +264,6 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
      * Remember {@link WebClient}s that are created, to release them properly.
      */
     private List<WebClient> clients = new ArrayList<WebClient>();
-
-    /**
-     * Remember channels that are created, to release them at the end.
-     */
-    private List<Channel> channels = new ArrayList<Channel>();
 
     /**
      * JavaScript "debugger" that provides you information about the JavaScript call stack
@@ -288,7 +290,7 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
     /**
      * Number of seconds until the test times out.
      */
-    public int timeout = 90;
+    public int timeout = Integer.getInteger("jenkins.test.timeout", System.getProperty("maven.surefire.debug") == null ? 180 : 0);
 
     private volatile Timer timeoutTimer;
 
@@ -309,7 +311,15 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
      * Override to set up your specific external resource.
      * @throws Throwable if setup fails (which will disable {@code after}
      */
-    protected void before() throws Throwable {
+    public void before() throws Throwable {
+        // Not ideal (https://github.com/junit-team/junit/issues/116) but basically works.
+        if (Boolean.getBoolean("ignore.random.failures")) {
+            RandomlyFails rf = testDescription.getAnnotation(RandomlyFails.class);
+            if (rf != null) {
+                throw new AssumptionViolatedException("Known to randomly fail: " + rf.value());
+            }
+        }
+
         env = new TestEnvironment(testDescription);
         env.pin();
         recipe();
@@ -343,13 +353,9 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
         // this allows tests to use a part of the URL space for itself.
         jenkins.getActions().add(this);
 
-        // cause all the descriptors to reload.
-        // ideally we'd like to reset them to properly emulate the behavior, but that's not possible.
-        Mailer.DescriptorImpl desc = Mailer.descriptor();
-        // prevent NPE with eclipse
-        if (desc != null) Mailer.descriptor().setHudsonUrl(null);
-        for( Descriptor d : jenkins.getExtensionList(Descriptor.class) )
-            d.load();
+        JenkinsLocationConfiguration.get().setUrl(getURL().toString());
+        
+        setUpTimeout();
     }
 
     /**
@@ -367,17 +373,21 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
         sites.clear();
         sites.add(new UpdateSite("default", updateCenterUrl));
     }
-
+    
     protected void setUpTimeout() {
-        if (timeout<=0)     return; // no timeout
-
+        if (timeout <= 0) {
+            System.out.println("Test timeout disabled.");
+            return;
+        }
         final Thread testThread = Thread.currentThread();
         timeoutTimer = new Timer();
         timeoutTimer.schedule(new TimerTask() {
             @Override
             public void run() {
-                if (timeoutTimer!=null)
+                if (timeoutTimer!=null) {
+                    LOGGER.warning(String.format("Test timed out (after %d seconds).", timeout));
                     testThread.interrupt();
+                }
             }
         }, TimeUnit.SECONDS.toMillis(timeout));
     }
@@ -385,8 +395,13 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
     /**
      * Override to tear down your specific external resource.
      */
-    protected void after() {
+    public void after() throws Exception {
         try {
+            if (jenkins!=null) {
+                for (EndOfTestListener tl : jenkins.getExtensionList(EndOfTestListener.class))
+                    tl.onTearDown();
+            }
+
             if (timeoutTimer!=null) {
                 timeoutTimer.cancel();
                 timeoutTimer = null;
@@ -404,20 +419,6 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
             }
             clients.clear();
 
-            for (Channel c : channels)
-                try {
-                    c.close();
-                } catch (IOException e) {
-                    // ignore
-                }
-            for (Channel c : channels)
-                try {
-                    c.join();
-                } catch (InterruptedException e) {
-                    // ignore
-                }
-            channels.clear();
-
         } finally {
             try {
                 server.stop();
@@ -431,7 +432,8 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
                     // ignore
                 }
 
-            jenkins.cleanUp();
+            if (jenkins!=null)
+                jenkins.cleanUp();
             ExtensionList.clearLegacyInstances();
             DescriptorExtensionList.clearLegacyInstances();
 
@@ -445,6 +447,7 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
             // but because there's no explicit dispose method on ClassLoader, they won't get GC-ed until
             // at some later point, leading to possible file descriptor overflow. So encourage GC now.
             // see http://bugs.sun.com/view_bug.do?bug_id=4950148
+            // TODO use URLClassLoader.close() in Java 7
             System.gc();
         }
     }
@@ -468,7 +471,6 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
                 Thread t = Thread.currentThread();
                 String o = t.getName();
                 t.setName("Executing "+ testDescription.getDisplayName());
-                CURRENT = JenkinsRule.this;
                 before();
                 try {
                     System.out.println("=== Starting " + testDescription.getDisplayName());
@@ -483,6 +485,11 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
                             throw new BreakException();
                         } catch (BreakException e) {}
 
+                        RandomlyFails rf = testDescription.getAnnotation(RandomlyFails.class);
+                        if (rf != null) {
+                            System.err.println("Note: known to randomly fail: " + rf.value());
+                        }
+
                         // dump threads
                         ThreadInfo[] threadInfos = Functions.getThreadInfos();
                         Functions.ThreadGroupMap m = Functions.sortThreadsAndGetGroupMap(threadInfos);
@@ -495,7 +502,6 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
                     after();
                     testDescription = null;
                     t.setName(o);
-                    CURRENT = null;
                 }
             }
         };
@@ -573,6 +579,8 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
 
         SocketConnector connector = new SocketConnector();
         connector.setHeaderBufferSize(12*1024); // use a bigger buffer as Stapler traces can get pretty large on deeply nested URL
+        if (System.getProperty("port")!=null)
+            connector.setPort(Integer.parseInt(System.getProperty("port")));
 
         server.setThreadPool(new ThreadPoolImpl(new ThreadPoolExecutor(10, 10, 10L, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(),new ThreadFactory() {
             public Thread newThread(Runnable r) {
@@ -607,25 +615,6 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
         return realm;
     }
 
-    @TestExtension
-    public static class ComputerListenerImpl extends ComputerListener {
-        @Override
-        public void onOnline(Computer c, TaskListener listener) throws IOException, InterruptedException {
-            VirtualChannel ch = c.getChannel();
-            if (ch instanceof Channel)
-                CURRENT.channels.add((Channel)ch);
-        }
-    }
-
-
-//    /**
-//     * Sets guest credentials to access java.net Subversion repo.
-//     */
-//    public void setJavaNetCredential() throws SVNException, IOException {
-//        // set the credential to access svn.dev.java.net
-//        jenkins.getDescriptorByType(SubversionSCM.DescriptorImpl.class).postCredential("https://svn.dev.java.net/svn
-// /hudson/","guest","",null,new PrintWriter(new NullStream()));
-//    }
 
     /**
      * Returns the older default Maven, while still allowing specification of other bundled Mavens.
@@ -647,13 +636,10 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
      */
     public Maven.MavenInstallation configureDefaultMaven(String mavenVersion, int mavenReqVersion) throws Exception {
         // first if we are running inside Maven, pick that Maven, if it meets the criteria we require..
-        // does it exists in the buildDirectory see maven-junit-plugin systemProperties
-        // buildDirectory -> ${project.build.directory} (so no reason to be null ;-) )
-        String buildDirectory = System.getProperty( "buildDirectory", "./target/classes/" );
-        File mavenAlreadyInstalled = new File(buildDirectory, mavenVersion);
-        if (mavenAlreadyInstalled.exists()) {
-            Maven.MavenInstallation
-                    mavenInstallation = new Maven.MavenInstallation("default",mavenAlreadyInstalled.getAbsolutePath(), NO_PROPERTIES);
+        File buildDirectory = new File(System.getProperty("buildDirectory", "target")); // TODO relative path
+        File mvnHome = new File(buildDirectory, mavenVersion);
+        if (mvnHome.exists()) {
+            Maven.MavenInstallation mavenInstallation = new Maven.MavenInstallation("default", mvnHome.getAbsolutePath(), NO_PROPERTIES);
             jenkins.getDescriptorByType(Maven.DescriptorImpl.class).setInstallations(mavenInstallation);
             return mavenInstallation;
         }
@@ -670,18 +656,17 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
 
         // otherwise extract the copy we have.
         // this happens when a test is invoked from an IDE, for example.
-        LOGGER.warning("Extracting a copy of Maven bundled in the test harness. " +
+        LOGGER.warning("Extracting a copy of Maven bundled in the test harness into " + mvnHome + ". " +
                 "To avoid a performance hit, set the system property 'maven.home' to point to a Maven2 installation.");
         FilePath mvn = jenkins.getRootPath().createTempFile("maven", "zip");
-        mvn.copyFrom(HudsonTestCase.class.getClassLoader().getResource(mavenVersion + "-bin.zip"));
-        File mvnHome =  new File(buildDirectory);//createTmpDir();
-        mvn.unzip(new FilePath(mvnHome));
+        mvn.copyFrom(JenkinsRule.class.getClassLoader().getResource(mavenVersion + "-bin.zip"));
+        mvn.unzip(new FilePath(buildDirectory));
         // TODO: switch to tar that preserves file permissions more easily
         if(!Functions.isWindows())
-            GNUCLibrary.LIBC.chmod(new File(mvnHome,mavenVersion+"/bin/mvn").getPath(),0755);
+            GNUCLibrary.LIBC.chmod(new File(mvnHome, "bin/mvn").getPath(),0755);
 
         Maven.MavenInstallation mavenInstallation = new Maven.MavenInstallation("default",
-                new File(mvnHome,mavenVersion).getAbsolutePath(), NO_PROPERTIES);
+                mvnHome.getAbsolutePath(), NO_PROPERTIES);
 		jenkins.getDescriptorByType(Maven.DescriptorImpl.class).setInstallations(mavenInstallation);
 		return mavenInstallation;
     }
@@ -697,7 +682,7 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
             LOGGER.warning("Extracting a copy of Ant bundled in the test harness. " +
                     "To avoid a performance hit, set the environment variable ANT_HOME to point to an  Ant installation.");
             FilePath ant = jenkins.getRootPath().createTempFile("ant", "zip");
-            ant.copyFrom(HudsonTestCase.class.getClassLoader().getResource("apache-ant-1.8.1-bin.zip"));
+            ant.copyFrom(JenkinsRule.class.getClassLoader().getResource("apache-ant-1.8.1-bin.zip"));
             File antHome = createTmpDir();
             ant.unzip(new FilePath(antHome));
             // TODO: switch to tar that preserves file permissions more easily
@@ -745,7 +730,17 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
      * @see #configureDefaultMaven()
      */
     public MavenModuleSet createMavenProject(String name) throws IOException {
-        return jenkins.createProject(MavenModuleSet.class,name);
+        MavenModuleSet mavenModuleSet = jenkins.createProject(MavenModuleSet.class,name);
+        mavenModuleSet.setRunHeadless( true );
+        return mavenModuleSet;
+    }
+
+    /**
+     * Creates a simple folder that other jobs can be placed in.
+     * @since 1.494
+     */
+    public MockFolder createFolder(String name) throws IOException {
+        return jenkins.createProject(MockFolder.class, name);
     }
 
     protected String createUniqueProjectName() {
@@ -761,7 +756,9 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
 
     /**
      * Allocates a new temporary directory for the duration of this test.
+     * @deprecated Use {@link TemporaryFolder} instead.
      */
+    @Deprecated
     public File createTmpDir() throws IOException {
         return env.temporaryDirectoryAllocator.allocate();
     }
@@ -780,26 +777,62 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
     /**
      * Creates a test {@link hudson.security.SecurityRealm} that recognizes username==password as valid.
      */
-    public SecurityRealm createDummySecurityRealm() {
-        return new AbstractPasswordBasedSecurityRealm() {
-            @Override
-            protected UserDetails authenticate(String username, String password) throws AuthenticationException {
-                if (username.equals(password))
-                    return loadUserByUsername(username);
-                throw new BadCredentialsException(username);
-            }
+    public DummySecurityRealm createDummySecurityRealm() {
+        return new DummySecurityRealm();
+    }
 
-            @Override
-            public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException,
-                    DataAccessException {
-                return new org.acegisecurity.userdetails.User(username,"",true,true,true,true,new GrantedAuthority[]{AUTHENTICATED_AUTHORITY});
-            }
+    /** @see #createDummySecurityRealm */
+    public static class DummySecurityRealm extends AbstractPasswordBasedSecurityRealm {
 
-            @Override
-            public GroupDetails loadGroupByGroupname(String groupname) throws UsernameNotFoundException, DataAccessException {
-                throw new UsernameNotFoundException(groupname);
+        private final Map<String,Set<String>> groupsByUser = new HashMap<String,Set<String>>();
+
+        DummySecurityRealm() {}
+
+        @Override
+        protected UserDetails authenticate(String username, String password) throws AuthenticationException {
+            if (username.equals(password))
+                return loadUserByUsername(username);
+            throw new BadCredentialsException(username);
+        }
+
+        @Override
+        public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException,
+                DataAccessException {
+            List<GrantedAuthority> auths = new ArrayList<GrantedAuthority>();
+            auths.add(AUTHENTICATED_AUTHORITY);
+            Set<String> groups = groupsByUser.get(username);
+            if (groups != null) {
+                for (String g : groups) {
+                    auths.add(new GrantedAuthorityImpl(g));
+                }
             }
-        };
+            return new org.acegisecurity.userdetails.User(username,"",true,true,true,true, auths.toArray(new GrantedAuthority[auths.size()]));
+        }
+
+        @Override
+        public GroupDetails loadGroupByGroupname(final String groupname) throws UsernameNotFoundException, DataAccessException {
+            for (Set<String> groups : groupsByUser.values()) {
+                if (groups.contains(groupname)) {
+                    return new GroupDetails() {
+                        @Override
+                        public String getName() {
+                            return groupname;
+                        }
+                    };
+                }
+            }
+            throw new UsernameNotFoundException(groupname);
+        }
+
+        /** Associate some groups with a username. */
+        public void addGroups(String username, String... groups) {
+            Set<String> gs = groupsByUser.get(username);
+            if (gs == null) {
+                groupsByUser.put(username, gs = new TreeSet<String>());
+            }
+            gs.addAll(Arrays.asList(groups));
+        }
+
     }
 
     /**
@@ -831,7 +864,7 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
     public DumbSlave createSlave(String nodeName, String labels, EnvVars env) throws Exception {
         synchronized (jenkins) {
             DumbSlave slave = new DumbSlave(nodeName, "dummy",
-    				createTmpDir().getPath(), "1", Node.Mode.NORMAL, labels==null?"":labels, createComputerLauncher(env), RetentionStrategy.NOOP, Collections.EMPTY_LIST);
+    				createTmpDir().getPath(), "1", Node.Mode.NORMAL, labels==null?"":labels, createComputerLauncher(env), RetentionStrategy.NOOP, Collections.EMPTY_LIST);                        
     		jenkins.addNode(slave);
     		return slave;
     	}
@@ -863,7 +896,7 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
     }
 
     /**
-     * Create a new slave on the local host and wait for it to come onilne
+     * Create a new slave on the local host and wait for it to come online
      * before returning.
      */
     public DumbSlave createOnlineSlave() throws Exception {
@@ -871,7 +904,7 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
     }
 
     /**
-     * Create a new slave on the local host and wait for it to come onilne
+     * Create a new slave on the local host and wait for it to come online
      * before returning.
      */
     public DumbSlave createOnlineSlave(Label l) throws Exception {
@@ -988,7 +1021,7 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
     }
 
     public <N extends Node> N configRoundtrip(N node) throws Exception {
-        submit(createWebClient().goTo("/computer/" + node.getNodeName() + "/configure").getFormByName("config"));
+        submit(createWebClient().goTo("computer/" + node.getNodeName() + "/configure").getFormByName("config"));
         return (N)jenkins.getNode(node.getNodeName());
     }
 
@@ -1090,7 +1123,8 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
      * Asserts that the XPath matches.
      */
     public void assertXPath(HtmlPage page, String xpath) {
-        assertThat(page.getDocumentElement(), hasXPath(xpath));
+        assertNotNull("There should be an object that matches XPath:" + xpath,
+                page.getDocumentElement().selectSingleNode(xpath));
     }
 
     /** Asserts that the XPath matches the contents of a DomNode page. This
@@ -1105,13 +1139,23 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
     }
 
     public void assertXPathValue(DomNode page, String xpath, String expectedValue) {
-        org.w3c.dom.Node node = page.getFirstByXPath(xpath);
-        assertThat(node, hasXPath(xpath, is(expectedValue)));
+        Object node = page.getFirstByXPath(xpath);
+        assertNotNull("no node found", node);
+        assertTrue("the found object was not a Node " + xpath, node instanceof org.w3c.dom.Node);
+
+        org.w3c.dom.Node n = (org.w3c.dom.Node) node;
+        String textString = n.getTextContent();
+        assertEquals("xpath value should match for " + xpath, expectedValue, textString);
     }
 
     public void assertXPathValueContains(DomNode page, String xpath, String needle) {
-        org.w3c.dom.Node node = page.getFirstByXPath(xpath);
-        assertThat(node, hasXPath(xpath, Matchers.containsString(needle)));
+        Object node = page.getFirstByXPath(xpath);
+        assertNotNull("no node found", node);
+        assertTrue("the found object was not a Node " + xpath, node instanceof org.w3c.dom.Node);
+
+        org.w3c.dom.Node n = (org.w3c.dom.Node) node;
+        String textString = n.getTextContent();
+        assertTrue("needle found in haystack", textString.contains(needle));
     }
 
     public void assertXPathResultsContainText(DomNode page, String xpath, String needle) {
@@ -1490,18 +1534,43 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
         if(all.isEmpty())    return; // nope
         
         recipes.add(new JenkinsRecipe.Runner() {
+            private File home;
+            private final List<Jpl> jpls = new ArrayList<Jpl>();
+
             @Override
             public void decorateHome(JenkinsRule testCase, File home) throws Exception {
-            	
+                this.home = home;
+                this.jpls.clear();
+
             	for (URL hpl : all) {
+                    Jpl jpl = new Jpl(hpl);
+                    jpl.loadManifest();
+                    jpls.add(jpl);
+                }
 
-                    // make the plugin itself available
-                    Manifest m = new Manifest(hpl.openStream());
-                    String shortName = m.getMainAttributes().getValue("Short-Name");
-                    if(shortName==null)
-                        throw new Error(hpl+" doesn't have the Short-Name attribute");
-                    FileUtils.copyURLToFile(hpl, new File(home, "plugins/" + shortName + ".jpl"));
+                for (Jpl jpl : jpls) {
+                    jpl.resolveDependencies();
+                }
+            }
 
+            class Jpl {
+                final URL jpl;
+                Manifest m;
+                private String shortName;
+
+                Jpl(URL jpl) {
+                    this.jpl = jpl;
+                }
+
+                void loadManifest() throws IOException {
+                    m = new Manifest(jpl.openStream());
+                    shortName = m.getMainAttributes().getValue("Short-Name");
+                    if(shortName ==null)
+                        throw new Error(jpl +" doesn't have the Short-Name attribute");
+                    FileUtils.copyURLToFile(jpl, new File(home, "plugins/" + shortName + ".jpl"));
+                }
+
+                void resolveDependencies() throws Exception {
                     // make dependency plugins available
                     // TODO: probably better to read POM, but where to read from?
                     // TODO: this doesn't handle transitive dependencies
@@ -1509,17 +1578,32 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
                     // Tom: plugins are now searched on the classpath first. They should be available on
                     // the compile or test classpath. As a backup, we do a best-effort lookup in the Maven repository
                     // For transitive dependencies, we could evaluate Plugin-Dependencies transitively.
-
                     String dependencies = m.getMainAttributes().getValue("Plugin-Dependencies");
                     if(dependencies!=null) {
-                        MavenEmbedder embedder = MavenUtil
-                                .createEmbedder(new StreamTaskListener(System.out, Charset.defaultCharset()),
-                                        (File) null, null);
+                        DEPENDENCY:
                         for( String dep : dependencies.split(",")) {
+                            String suffix = ";resolution:=optional";
+                            boolean optional = dep.endsWith(suffix);
+                            if (optional) {
+                                dep = dep.substring(0, dep.length() - suffix.length());
+                            }
                             String[] tokens = dep.split(":");
                             String artifactId = tokens[0];
                             String version = tokens[1];
-                            File dependencyJar=resolveDependencyJar(embedder,artifactId,version);
+
+                            for (Jpl other : jpls) {
+                                if (other.shortName.equals(artifactId))
+                                    continue DEPENDENCY;    // resolved from another JPL file
+                            }
+
+                            File dependencyJar=resolveDependencyJar(artifactId,version);
+                            if (dependencyJar == null) {
+                                if (optional) {
+                                    System.err.println("cannot resolve optional dependency " + dep + " of " + shortName + "; skipping");
+                                    continue;
+                                }
+                                throw new IOException("Could not resolve " + dep + " in " + System.getProperty("java.class.path"));
+                            }
 
                             File dst = new File(home, "plugins/" + artifactId + ".jpi");
                             if(!dst.exists() || dst.lastModified()!=dependencyJar.lastModified()) {
@@ -1530,7 +1614,19 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
                 }
             }
 
-            private File resolveDependencyJar(MavenEmbedder embedder, String artifactId, String version) throws Exception {
+            /**
+             * Lazily created embedder.
+             */
+            private MavenEmbedder embedder;
+
+            private MavenEmbedder getMavenEmbedder() throws MavenEmbedderException, IOException {
+                if (embedder==null)
+                    embedder = MavenUtil.createEmbedder(new StreamTaskListener(System.out, Charset.defaultCharset()),
+                                                    (File) null, null);
+                return embedder;
+            }
+
+            private @CheckForNull File resolveDependencyJar(String artifactId, String version) throws Exception {
                 // try to locate it from manifest
                 Enumeration<URL> manifests = getClass().getClassLoader().getResources("META-INF/MANIFEST.MF");
                 while (manifests.hasMoreElements()) {
@@ -1543,10 +1639,30 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
                         return Which.jarFile(manifest);
                 }
 
+                // For snapshot plugin dependencies, an IDE may have replaced ~/.m2/repository/…/${artifactId}.hpi with …/${artifactId}-plugin/target/classes/
+                // which unfortunately lacks META-INF/MANIFEST.MF so try to find index.jelly (which every plugin should include) and thus the ${artifactId}.hpi:
+                Enumeration<URL> jellies = getClass().getClassLoader().getResources("index.jelly");
+                while (jellies.hasMoreElements()) {
+                    URL jellyU = jellies.nextElement();
+                    if (jellyU.getProtocol().equals("file")) {
+                        File jellyF = new File(jellyU.toURI());
+                        File classes = jellyF.getParentFile();
+                        if (classes.getName().equals("classes")) {
+                            File target = classes.getParentFile();
+                            if (target.getName().equals("target")) {
+                                File hpi = new File(target, artifactId + ".hpi");
+                                if (hpi.isFile()) {
+                                    return hpi;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // need to search multiple group IDs
                 // TODO: extend manifest to include groupID:artifactID:version
                 Exception resolutionError=null;
-                for (String groupId : new String[]{"org.jvnet.hudson.plugins","org.jvnet.hudson.main"}) {
+                for (String groupId : PLUGIN_GROUPIDS) {
 
                     // first try to find it on the classpath.
                     // this takes advantage of Maven POM located in POM
@@ -1558,11 +1674,11 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
 
                     	try {
                     		// currently the most of the plugins are still hpi
-                            return resolvePluginFile(embedder, artifactId, version, groupId, "hpi");
+                            return resolvePluginFile(artifactId, version, groupId, "hpi");
                     	} catch(AbstractArtifactResolutionException x){
                     		try {
                     			// but also try with the new jpi
-                    		    return resolvePluginFile(embedder, artifactId, version, groupId, "jpi");
+                    		    return resolvePluginFile(artifactId, version, groupId, "jpi");
                     		} catch(AbstractArtifactResolutionException x2){
                                 // could be a wrong groupId
                                 resolutionError = x;
@@ -1575,10 +1691,10 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
                 throw new Exception("Failed to resolve plugin: "+artifactId+" version "+version,resolutionError);
             }
             
-            private File resolvePluginFile(MavenEmbedder embedder, String artifactId, String version, String groupId, String type)
-					throws MavenEmbedderException, ComponentLookupException, AbstractArtifactResolutionException {
-				final Artifact jpi = embedder.createArtifact(groupId, artifactId, version, "compile"/*doesn't matter*/, type);
-				embedder.resolve(jpi, Arrays.asList(embedder.createRepository("http://maven.glassfish.org/content/groups/public/","repo")),embedder.getLocalRepository());
+            private @CheckForNull File resolvePluginFile(String artifactId, String version, String groupId, String type) throws Exception {
+				final Artifact jpi = getMavenEmbedder().createArtifact(groupId, artifactId, version, "compile"/*doesn't matter*/, type);
+                getMavenEmbedder().resolve(jpi,
+                        Arrays.asList(getMavenEmbedder().createRepository("http://maven.glassfish.org/content/groups/public/", "repo")), embedder.getLocalRepository());
 				return jpi.getFile();
 				
 			}
@@ -1595,7 +1711,7 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
 
     /**
      * Declares that this test case expects to start with one of the preset data sets.
-     * See https://svn.dev.java.net/svn/hudson/trunk/hudson/main/test/src/main/preset-data/
+     * See {@code test/src/main/preset-data/}
      * for available datasets and what they mean.
      */
     public JenkinsRule withPresetData(String name) {
@@ -1617,7 +1733,7 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
      * in the context of an HTTP request.
      *
      * <p>
-     * In {@link HudsonTestCase}, a thread that's executing the test code is different from the thread
+     * In {@link JenkinsRule}, a thread that's executing the test code is different from the thread
      * that carries out HTTP requests made through {@link WebClient}. But sometimes you want to
      * make assertions and other calls with side-effect from within the request handling thread.
      *
@@ -1716,15 +1832,28 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
         }
 
         /**
-         * Logs in to Hudson.
+         * Logs in to Jenkins.
          */
         public WebClient login(String username, String password) throws Exception {
-            HtmlPage page = goTo("/login");
+            return login(username,password,false);
+        }
+
+        /**
+         * Logs in to Jenkins.
+         */
+        public WebClient login(String username, String password, boolean rememberMe) throws Exception {
+            HtmlPage page = goTo("login");
 //            page = (HtmlPage) page.getFirstAnchorByText("Login").click();
 
             HtmlForm form = page.getFormByName("login");
             form.getInputByName("j_username").setValueAttribute(username);
             form.getInputByName("j_password").setValueAttribute(password);
+            try {
+                form.getInputByName("remember_me").setChecked(rememberMe);
+            } catch (ElementNotFoundException e) {
+                // remember me not available is OK so long as the caller didn't ask for it
+                assert !rememberMe;
+            }
             form.submit(null);
             return this;
         }
@@ -1733,7 +1862,7 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
          * Logs in to Hudson, by using the user name as the password.
          *
          * <p>
-         * See {@link HudsonTestCase#configureUserRealm()} for how the container is set up with the user names
+         * See {@link #configureUserRealm} for how the container is set up with the user names
          * and passwords. All the test accounts have the same user name and password.
          */
         public WebClient login(String username) throws Exception {
@@ -1746,7 +1875,7 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
          * in the context of an HTTP request.
          *
          * <p>
-         * In {@link HudsonTestCase}, a thread that's executing the test code is different from the thread
+         * In {@link JenkinsRule}, a thread that's executing the test code is different from the thread
          * that carries out HTTP requests made through {@link WebClient}. But sometimes you want to
          * make assertions and other calls with side-effect from within the request handling thread.
          *
@@ -1849,10 +1978,10 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
         }
 
         /**
-         * Requests a page within Hudson.
+         * Requests an HTML page within Jenkins.
          *
          * @param relative
-         *      Relative path within Hudson. Starts without '/'.
+         *      Relative path within Jenkins. Starts without '/'.
          *      For example, "job/test/" to go to a job top page.
          */
         public HtmlPage goTo(String relative) throws IOException, SAXException {
@@ -1864,13 +1993,35 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
             }
         }
 
-        public Page goTo(String relative, String expectedContentType) throws IOException, SAXException {
-            Page p = super.getPage(getContextPath() + relative);
-            assertThat(p.getWebResponse().getContentType(), is(expectedContentType));
+        /**
+         * Requests a page within Jenkins.
+         *
+         * @param relative
+         *      Relative path within Jenkins. Starts without '/'.
+         *      For example, "job/test/" to go to a job top page.
+         * @param expectedContentType the expected {@link WebResponse#getContentType}, or null to do no such check
+         */
+        public Page goTo(String relative, @CheckForNull String expectedContentType) throws IOException, SAXException {
+            assert !relative.startsWith("/");
+            Page p;
+            try {
+                p = super.getPage(getContextPath() + relative);
+            } catch (IOException x) {
+                Throwable cause = x.getCause();
+                if (cause instanceof SocketTimeoutException) {
+                    throw new AssumptionViolatedException("failed to get " + relative + " due to read timeout", cause);
+                } else if (cause != null) {
+                    cause.printStackTrace(); // SUREFIRE-1067 workaround
+                }
+                throw x;
+            }
+            if (expectedContentType != null) {
+                assertThat(p.getWebResponse().getContentType(), is(expectedContentType));
+            }
             return p;
         }
 
-        /** Loads a page as XML. Useful for testing Hudson's xml api, in concert with
+        /** Loads a page as XML. Useful for testing Jenkins's XML API, in concert with
          * assertXPath(DomNode page, String xpath)
          * @param path   the path part of the url to visit
          * @return  the XmlPage found at that url
@@ -1885,10 +2036,25 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
                 return null;
         }
 
+        /**
+         * Verify that the server rejects an attempt to load the given page.
+         * @param url a URL path (relative to Jenkins root)
+         * @param statusCode the expected failure code (such as {@link HttpURLConnection#HTTP_FORBIDDEN})
+         * @since 1.504
+         */
+        public void assertFails(String url, int statusCode) throws Exception {
+            assert !url.startsWith("/");
+            try {
+                fail(url + " should have been rejected but produced: " + super.getPage(getContextPath() + url).getWebResponse().getContentAsString());
+            } catch (FailingHttpStatusCodeException x) {
+                assertEquals(statusCode, x.getStatusCode());
+            }
+        }
 
         /**
          * Returns the URL of the webapp top page.
          * URL ends with '/'.
+         * <p>This is actually the same as {@link #getURL} and should not be confused with {@link #contextPath}.
          */
         public String getContextPath() throws IOException {
             return getURL().toExternalForm();
@@ -2005,7 +2171,7 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
     /**
      * Specify this to a TCP/IP port number to have slaves started with the debugger.
      */
-    public static int SLAVE_DEBUG_PORT = Integer.getInteger(HudsonTestCase.class.getName()+".slaveDebugPort",-1);
+    public static final int SLAVE_DEBUG_PORT = Integer.getInteger(HudsonTestCase.class.getName()+".slaveDebugPort",-1);
 
     public static final MimeTypes MIME_TYPES = new MimeTypes();
     static {
@@ -2066,4 +2232,6 @@ public class JenkinsRule implements TestRule, MethodRule, RootAction {
     public Description getTestDescription() {
         return testDescription;
     }
+
+    public static final List<String> PLUGIN_GROUPIDS = new ArrayList<String>(Arrays.asList("org.jvnet.hudson.plugins", "org.jvnet.hudson.main"));
 }

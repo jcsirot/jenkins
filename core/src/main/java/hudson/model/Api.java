@@ -23,8 +23,9 @@
  */
 package hudson.model;
 
-import hudson.util.IOException2;
 import jenkins.model.Jenkins;
+import jenkins.security.SecureRequester;
+
 import org.dom4j.CharacterData;
 import org.dom4j.Document;
 import org.dom4j.DocumentException;
@@ -45,6 +46,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.StringReader;
 import java.io.StringWriter;
+import java.net.HttpURLConnection;
 import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -58,6 +60,7 @@ import java.util.logging.Logger;
  *
  * @author Kohsuke Kawaguchi
  * @see Exported
+ * @see SecureRequester
  */
 public class Api extends AbstractModelObject {
     /**
@@ -148,20 +151,24 @@ public class Api extends AbstractModelObject {
 
         } catch (DocumentException e) {
             LOGGER.log(Level.FINER, "Failed to do XPath/wrapper handling. XML is as follows:"+sw, e);
-            throw new IOException2("Failed to do XPath/wrapper handling. Turn on FINER logging to view XML.",e);
+            throw new IOException("Failed to do XPath/wrapper handling. Turn on FINER logging to view XML.",e);
         }
 
+
+        if (isSimpleOutput(result) && !permit(req)) {
+            // simple output prohibited
+            rsp.sendError(HttpURLConnection.HTTP_FORBIDDEN, "primitive XPath result sets forbidden; implement jenkins.security.SecureRequester");
+            return;
+        }
+
+        // switch to gzipped output
         OutputStream o = rsp.getCompressedOutputStream(req);
         try {
-            if(result instanceof CharacterData) {
+            if (isSimpleOutput(result)) {
+                // simple output allowed
                 rsp.setContentType("text/plain;charset=UTF-8");
-                o.write(((CharacterData)result).getText().getBytes("UTF-8"));
-                return;
-            }
-
-            if(result instanceof String || result instanceof Number || result instanceof Boolean) {
-                rsp.setContentType("text/plain;charset=UTF-8");
-                o.write(result.toString().getBytes("UTF-8"));
+                String text = result instanceof CharacterData ? ((CharacterData) result).getText() : result.toString();
+                o.write(text.getBytes("UTF-8"));
                 return;
             }
 
@@ -171,6 +178,10 @@ public class Api extends AbstractModelObject {
         } finally {
             o.close();
         }
+    }
+
+    private boolean isSimpleOutput(Object result) {
+        return result instanceof CharacterData || result instanceof String || result instanceof Number || result instanceof Boolean;
     }
 
     /**
@@ -188,8 +199,12 @@ public class Api extends AbstractModelObject {
      * Exposes the bean as JSON.
      */
     public void doJson(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
-        setHeaders(rsp);
-        rsp.serveExposedBean(req,bean, Flavor.JSON);
+        if (req.getParameter("jsonp") == null || permit(req)) {
+            setHeaders(rsp);
+            rsp.serveExposedBean(req,bean, Flavor.JSON);
+        } else {
+            rsp.sendError(HttpURLConnection.HTTP_FORBIDDEN, "jsonp forbidden; implement jenkins.security.SecureRequester");
+        }
     }
 
     /**
@@ -200,6 +215,15 @@ public class Api extends AbstractModelObject {
         rsp.serveExposedBean(req,bean, Flavor.PYTHON);
     }
 
+    private boolean permit(StaplerRequest req) {
+        for (SecureRequester r : Jenkins.getInstance().getExtensionList(SecureRequester.class)) {
+            if (r.permit(req, bean)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void setHeaders(StaplerResponse rsp) {
         rsp.setHeader("X-Jenkins", Jenkins.VERSION);
         rsp.setHeader("X-Jenkins-Session", Jenkins.SESSION_HASH);
@@ -207,4 +231,5 @@ public class Api extends AbstractModelObject {
 
     private static final Logger LOGGER = Logger.getLogger(Api.class.getName());
     private static final ModelBuilder MODEL_BUILDER = new ModelBuilder();
+
 }

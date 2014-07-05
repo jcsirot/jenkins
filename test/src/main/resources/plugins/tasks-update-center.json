@@ -1,4 +1,5 @@
-{
+updateCenter.post(
+{"connectionCheckUrl":"http://www.google.com/", // has to be here because updateDirectly sniffs only very limited formats
     "core": {
         "buildDate": "Dec 31, 1969",
         "name": "core",
@@ -15,7 +16,7 @@
             "name": "tasks",
             "requiredCore": "1.264",
             "sha1": "wtzlciUKiMcg90H5CTYkGX6+r8Y=",
-            "title": "Hudson Task Scanner Plug-in",
+            "title": "Jenkins Task Scanner Plug-in",
             "url": "tasks.jpi",
             "version": "2.23"
         },
@@ -34,3 +35,4 @@
     },
     "updateCenterVersion": 1
 }
+);

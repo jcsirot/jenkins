@@ -31,16 +31,22 @@ import hudson.model.AbstractBuild;
 import hudson.model.AbstractProject;
 import hudson.model.BuildListener;
 import hudson.model.Result;
+import hudson.remoting.VirtualChannel;
 import hudson.util.FormValidation;
+import java.io.File;
+
+import org.apache.tools.ant.types.FileSet;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.QueryParameter;
 
-import java.io.File;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 
 import net.sf.json.JSONObject;
+import javax.annotation.Nonnull;
 
 /**
  * Copies the artifacts into an archive directory.
@@ -63,15 +69,59 @@ public class ArtifactArchiver extends Recorder {
      * Just keep the last successful artifact set, no more.
      */
     private final boolean latestOnly;
-    
-    private static final Boolean allowEmptyArchive = 
-    	Boolean.getBoolean(ArtifactArchiver.class.getName()+".warnOnEmpty");
+
+    /**
+     * Fail (or not) the build if archiving returns nothing.
+     */
+    @Nonnull
+    private Boolean allowEmptyArchive;
+
+    /**
+     * Archive only if build is successful, skip archiving on failed builds.
+     */
+    private boolean onlyIfSuccessful;
+
+
+    /**
+     * Default ant exclusion
+     */
+    @Nonnull
+    private Boolean defaultExcludes;
+
+
+    public ArtifactArchiver(String artifacts, String excludes, boolean latestOnly) {
+        this(artifacts, excludes, latestOnly, false, false);
+    }
+
+    public ArtifactArchiver(String artifacts, String excludes, boolean latestOnly, boolean allowEmptyArchive) {
+        this(artifacts, excludes, latestOnly, allowEmptyArchive, false);
+    }
+
+
+    public ArtifactArchiver(String artifacts, String excludes, boolean latestOnly, boolean allowEmptyArchive, boolean onlyIfSuccessful) {
+        this(artifacts, excludes , latestOnly , allowEmptyArchive, onlyIfSuccessful , true);
+    }
+
 
     @DataBoundConstructor
-    public ArtifactArchiver(String artifacts, String excludes, boolean latestOnly) {
+    public ArtifactArchiver(String artifacts, String excludes, boolean latestOnly, boolean allowEmptyArchive, boolean onlyIfSuccessful, Boolean defaultExcludes) {
         this.artifacts = artifacts.trim();
         this.excludes = Util.fixEmptyAndTrim(excludes);
         this.latestOnly = latestOnly;
+        this.allowEmptyArchive = allowEmptyArchive;
+        this.onlyIfSuccessful = onlyIfSuccessful;
+        this.defaultExcludes = defaultExcludes;
+    }
+
+    // Backwards compatibility for older builds
+    public Object readResolve() {
+        if (allowEmptyArchive == null) {
+            this.allowEmptyArchive = Boolean.getBoolean(ArtifactArchiver.class.getName()+".warnOnEmpty");
+        }
+        if (defaultExcludes == null){
+            defaultExcludes = true;
+        }
+        return this;
     }
 
     public String getArtifacts() {
@@ -85,7 +135,19 @@ public class ArtifactArchiver extends Recorder {
     public boolean isLatestOnly() {
         return latestOnly;
     }
-    
+
+    public boolean isOnlyIfSuccessful() {
+        return onlyIfSuccessful;
+    }
+
+    public boolean getAllowEmptyArchive() {
+        return allowEmptyArchive;
+    }
+
+    public boolean isDefaultExcludes() {
+        return defaultExcludes;
+    }
+
     private void listenerWarnOrError(BuildListener listener, String message) {
     	if (allowEmptyArchive) {
     		listener.getLogger().println(String.format("WARN: %s", message));
@@ -101,9 +163,11 @@ public class ArtifactArchiver extends Recorder {
             build.setResult(Result.FAILURE);
             return true;
         }
-        
-        File dir = build.getArtifactsDir();
-        dir.mkdirs();
+
+        if (onlyIfSuccessful && build.getResult() != null && build.getResult().isWorseThan(Result.UNSTABLE)) {
+            listener.getLogger().println(Messages.ArtifactArchiver_SkipBecauseOnlyIfSuccessful());
+            return true;
+        }
 
         listener.getLogger().println(Messages.ArtifactArchiver_ARCHIVING_ARTIFACTS());
         try {
@@ -113,8 +177,13 @@ public class ArtifactArchiver extends Recorder {
             }
 
             String artifacts = build.getEnvironment(listener).expand(this.artifacts);
-            if(ws.copyRecursiveTo(artifacts,excludes,new FilePath(dir))==0) {
-                if(build.getResult().isBetterOrEqualTo(Result.UNSTABLE)) {
+
+            Map<String,String> files = ws.act(new ListFiles(artifacts, excludes, defaultExcludes));
+            if (!files.isEmpty()) {
+                build.pickArtifactManager().archive(ws, launcher, listener, files);
+            } else {
+                Result result = build.getResult();
+                if (result != null && result.isBetterOrEqualTo(Result.UNSTABLE)) {
                     // If the build failed, don't complain that there was no matching artifact.
                     // The build probably didn't even get to the point where it produces artifacts. 
                     listenerWarnOrError(listener, Messages.ArtifactArchiver_NoMatchFound(artifacts));
@@ -136,10 +205,35 @@ public class ArtifactArchiver extends Recorder {
             Util.displayIOException(e,listener);
             e.printStackTrace(listener.error(
                     Messages.ArtifactArchiver_FailedToArchive(artifacts)));
+            build.setResult(Result.FAILURE);
             return true;
         }
 
         return true;
+    }
+
+    private static final class ListFiles implements FilePath.FileCallable<Map<String,String>> {
+        private static final long serialVersionUID = 1;
+        private final String includes, excludes;
+        private final boolean defaultExcludes;
+
+        ListFiles(String includes, String excludes, boolean defaultExcludes) {
+            this.includes = includes;
+            this.excludes = excludes;
+            this.defaultExcludes = defaultExcludes;
+        }
+        @Override public Map<String,String> invoke(File basedir, VirtualChannel channel) throws IOException, InterruptedException {
+            Map<String,String> r = new HashMap<String,String>();
+
+            FileSet fileSet = Util.createFileSet(basedir, includes, excludes);
+            fileSet.setDefaultexcludes(defaultExcludes);
+
+            for (String f : fileSet.getDirectoryScanner().getIncludedFiles()) {
+                f = f.replace(File.separatorChar, '/');
+                r.put(f, f);
+            }
+            return r;
+        }
     }
 
     @Override
@@ -148,17 +242,19 @@ public class ArtifactArchiver extends Recorder {
             AbstractBuild<?,?> b = build.getProject().getLastCompletedBuild();
             Result bestResultSoFar = Result.NOT_BUILT;
             while(b!=null) {
-                if (b.getResult().isBetterThan(bestResultSoFar)) {
-                    bestResultSoFar = b.getResult();
-                } else {
-                    // remove old artifacts
-                    File ad = b.getArtifactsDir();
-                    if(ad.exists()) {
-                        listener.getLogger().println(Messages.ArtifactArchiver_DeletingOld(b.getDisplayName()));
+                if(b.getResult()!=null){
+                    if (b.getResult().isBetterThan(bestResultSoFar)) {
+                        bestResultSoFar = b.getResult();
+                    } else {
+                        // remove old artifacts
                         try {
-                            Util.deleteRecursive(ad);
+                            if (b.getArtifactManager().delete()) {
+                                listener.getLogger().println(Messages.ArtifactArchiver_DeletingOld(b.getDisplayName()));
+                            }
                         } catch (IOException e) {
                             e.printStackTrace(listener.error(e.getMessage()));
+                        } catch (InterruptedException x) {
+                            x.printStackTrace(listener.error(x.getMessage()));
                         }
                     }
                 }

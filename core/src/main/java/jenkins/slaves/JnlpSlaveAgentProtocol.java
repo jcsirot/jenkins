@@ -4,17 +4,20 @@ import hudson.AbortException;
 import hudson.Extension;
 import hudson.remoting.Channel;
 import hudson.remoting.Channel.Listener;
+import hudson.remoting.ChannelBuilder;
 import hudson.remoting.Engine;
 import hudson.slaves.SlaveComputer;
 import jenkins.AgentProtocol;
 import jenkins.model.Jenkins;
+import jenkins.security.HMACConfidentialKey;
+import org.jenkinsci.remoting.nio.NioChannelHub;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
+import javax.inject.Inject;
+import java.io.BufferedWriter;
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.net.Socket;
 import java.util.logging.Level;
@@ -31,10 +34,10 @@ import java.util.logging.Logger;
  * unauthorized remote slaves.
  *
  * <p>
- * The approach here is to have {@link Jenkins#getSecretKey() a secret key} on the master.
- * This key is sent to the slave inside the <tt>.jnlp</tt> file
+ * We do this by computing HMAC of the slave name.
+ * This code is sent to the slave inside the <tt>.jnlp</tt> file
  * (this file itself is protected by HTTP form-based authentication that
- * we use everywhere else in Hudson), and the slave sends this
+ * we use everywhere else in Jenkins), and the slave sends this
  * token back when it connects to the master.
  * Unauthorized slaves can't access the protected <tt>.jnlp</tt> file,
  * so it can't impersonate a valid slave.
@@ -50,6 +53,9 @@ import java.util.logging.Logger;
  */
 @Extension
 public class JnlpSlaveAgentProtocol extends AgentProtocol {
+    @Inject
+    NioChannelSelector hub;
+
     @Override
     public String getName() {
         return "JNLP-connect";
@@ -57,47 +63,43 @@ public class JnlpSlaveAgentProtocol extends AgentProtocol {
 
     @Override
     public void handle(Socket socket) throws IOException, InterruptedException {
-        new Handler(socket).run();
+        new Handler(hub.getHub(),socket).run();
     }
 
-    protected static class Handler {
-        protected final Socket socket;
+    protected static class Handler extends JnlpSlaveHandshake {
 
         /**
-         * Wrapping Socket input stream.
+         * @deprecated as of 1.559
+         *      Use {@link #Handler(NioChannelHub, Socket)}
          */
-        protected final DataInputStream in;
-
-        /**
-         * For writing handshaking response.
-         *
-         * This is a poor design choice that we just carry forward for compatibility.
-         * For better protocol design, {@link DataOutputStream} is preferred for newer
-         * protocols.
-         */
-        protected final PrintWriter out;
-
         public Handler(Socket socket) throws IOException {
-            this.socket = socket;
-            in = new DataInputStream(socket.getInputStream());
-            out = new PrintWriter(socket.getOutputStream(),true);
+            this(null,socket);
+        }
+
+        public Handler(NioChannelHub hub, Socket socket) throws IOException {
+            super(hub,socket,
+                    new DataInputStream(socket.getInputStream()),
+                    new PrintWriter(new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(),"UTF-8")),true));
         }
 
         protected void run() throws IOException, InterruptedException {
-            if(!getSecretKey().equals(in.readUTF())) {
-                error(out, "Unauthorized access");
+            final String secret = in.readUTF();
+            final String nodeName = in.readUTF();
+
+            if(!SLAVE_SECRET.mac(nodeName).equals(secret)) {
+                error("Unauthorized access");
                 return;
             }
 
-            final String nodeName = in.readUTF();
+
             SlaveComputer computer = (SlaveComputer) Jenkins.getInstance().getComputer(nodeName);
             if(computer==null) {
-                error(out, "No such slave: "+nodeName);
+                error("No such slave: "+nodeName);
                 return;
             }
 
             if(computer.getChannel()!=null) {
-                error(out, nodeName+" is already connected to this master. Rejecting this connection.");
+                error(nodeName+" is already connected to this master. Rejecting this connection.");
                 return;
             }
 
@@ -113,7 +115,9 @@ public class JnlpSlaveAgentProtocol extends AgentProtocol {
             logw.println("JNLP agent connected from "+ socket.getInetAddress());
 
             try {
-                computer.setChannel(new BufferedInputStream(socket.getInputStream()), new BufferedOutputStream(socket.getOutputStream()), log,
+                ChannelBuilder cb = createChannelBuilder(nodeName);
+
+                computer.setChannel(cb.withHeaderStream(log).build(socket), log,
                     new Listener() {
                         @Override
                         public void onClosed(Channel channel, IOException cause) {
@@ -137,17 +141,12 @@ public class JnlpSlaveAgentProtocol extends AgentProtocol {
                 throw e;
             }
         }
-
-        protected String getSecretKey() {
-            return Jenkins.getInstance().getSecretKey();
-        }
-
-        protected void error(PrintWriter out, String msg) throws IOException {
-            out.println(msg);
-            LOGGER.log(Level.WARNING,Thread.currentThread().getName()+" is aborted: "+msg);
-            socket.close();
-        }
     }
 
     private static final Logger LOGGER = Logger.getLogger(JnlpSlaveAgentProtocol.class.getName());
+
+    /**
+     * This secret value is used as a seed for slaves.
+     */
+    public static final HMACConfidentialKey SLAVE_SECRET = new HMACConfidentialKey(JnlpSlaveAgentProtocol.class,"secret");
 }
